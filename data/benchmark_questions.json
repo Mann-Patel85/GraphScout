@@ -1,0 +1,16 @@
+[
+  {
+    "question_id": "q1",
+    "question": "What is the supply risk between Company Alpha, Project Titan, and Supplier Omega?",
+    "complexity": "multi-hop",
+    "required_hops": 2,
+    "ground_truth": "Company Alpha developed Project Titan which depends on Supplier Omega for lithium cathode supply. Export bans on Supplier Omega pose direct supply disruption."
+  },
+  {
+    "question_id": "q2",
+    "question": "Which subsidiary of Company Alpha was affected by the 2024 rare-earth supply restriction?",
+    "complexity": "multi-hop-temporal",
+    "required_hops": 3,
+    "ground_truth": "Project Titan under Company Alpha was restricted due to trade policy updates with Supplier Omega."
+  }
+]

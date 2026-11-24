@@ -1,0 +1,206 @@
+// ==============================================================================
+// GraphScout Knowledge Graph Schema (TigerGraph GSQL)
+// System: Agentic GraphRAG System with Hybrid Vector & Relational Multi-Hop Index
+// ==============================================================================
+
+CREATE GRAPH GraphScoutKG()
+
+USE GRAPH GraphScoutKG
+
+// ------------------------------------------------------------------------------
+// 1. VERTEX DEFINITIONS
+// ------------------------------------------------------------------------------
+
+// Document Vertex: Source artifacts (reports, research papers, documentation)
+CREATE VERTEX Document (
+    PRIMARY_ID doc_id STRING,
+    title STRING,
+    source_url STRING,
+    doc_type STRING,
+    published_at STRING,
+    version INT,
+    created_at DATETIME,
+    metadata STRING
+) WITH STATS="OUTDEGREE";
+
+// Chunk Vertex: Dense vector text segment for semantic search
+CREATE VERTEX Chunk (
+    PRIMARY_ID chunk_id STRING,
+    chunk_index INT,
+    text_content STRING,
+    token_count INT,
+    embedding LIST<DOUBLE>,
+    section_header STRING,
+    created_at DATETIME
+) WITH STATS="OUTDEGREE";
+
+// Entity Vertex: Extracted named entities (Organizations, People, Projects, Technologies)
+CREATE VERTEX Entity (
+    PRIMARY_ID entity_id STRING,
+    canonical_name STRING,
+    entity_type STRING,
+    description STRING,
+    aliases LIST<STRING>,
+    importance_score DOUBLE DEFAULT 1.0,
+    created_at DATETIME
+) WITH STATS="OUTDEGREE";
+
+// Event Vertex: Temporal milestones, updates, policy shifts, and incidents
+CREATE VERTEX Event (
+    PRIMARY_ID event_id STRING,
+    event_name STRING,
+    event_type STRING,
+    event_date DATETIME,
+    description STRING,
+    details STRING,
+    created_at DATETIME
+) WITH STATS="OUTDEGREE";
+
+// ------------------------------------------------------------------------------
+// 2. EDGE DEFINITIONS
+// ------------------------------------------------------------------------------
+
+// Document contains Chunk
+CREATE DIRECTED EDGE HAS_CHUNK (FROM Document, TO Chunk) WITH REVERSE_EDGE="CHUNK_OF";
+
+// Chunk explicitly mentions an Entity
+CREATE DIRECTED EDGE MENTIONS (
+    FROM Chunk, 
+    TO Entity, 
+    mention_count INT, 
+    confidence_score DOUBLE, 
+    context_snippet STRING
+) WITH REVERSE_EDGE="MENTIONED_IN";
+
+// Entity relates to another Entity (multi-hop traversal backbone)
+CREATE UNDIRECTED EDGE RELATED_TO (
+    FROM Entity, 
+    TO Entity, 
+    relation_type STRING, 
+    weight DOUBLE, 
+    confidence DOUBLE, 
+    provenance_chunk_id STRING,
+    evidence_snippet STRING, 
+    created_at DATETIME
+);
+
+// Entity participated in an Event
+CREATE DIRECTED EDGE PARTICIPATES_IN (
+    FROM Entity, 
+    TO Event, 
+    role STRING, 
+    confidence DOUBLE
+) WITH REVERSE_EDGE="PARTICIPANTS";
+
+// SUPERSEDES Edge: Handles contradictory, outdated, or amended facts
+CREATE DIRECTED EDGE SUPERSEDES (
+    FROM Event, 
+    TO Event, 
+    superseded_at DATETIME, 
+    reason STRING
+) WITH REVERSE_EDGE="SUPERSEDED_BY";
+
+CREATE DIRECTED EDGE DOC_SUPERSEDES (
+    FROM Document, 
+    TO Document, 
+    superseded_at DATETIME, 
+    reason STRING
+) WITH REVERSE_EDGE="DOC_SUPERSEDED_BY";
+
+// ------------------------------------------------------------------------------
+// 3. SCHEMA CHANGE COMMIT
+// ------------------------------------------------------------------------------
+SCHEMA_CHANGE JOB add_graphscout_schema FOR GRAPH GraphScoutKG {
+    ADD VERTEX Document;
+    ADD VERTEX Chunk;
+    ADD VERTEX Entity;
+    ADD VERTEX Event;
+
+    ADD EDGE HAS_CHUNK;
+    ADD EDGE MENTIONS;
+    ADD EDGE RELATED_TO;
+    ADD EDGE PARTICIPATES_IN;
+    ADD EDGE SUPERSEDES;
+    ADD EDGE DOC_SUPERSEDES;
+}
+RUN SCHEMA_CHANGE JOB add_graphscout_schema
+DROP JOB add_graphscout_schema
+
+// ------------------------------------------------------------------------------
+// 4. CORE GSQL QUERIES FOR AGENTIC MULTI-HOP EXPLORATION
+// ------------------------------------------------------------------------------
+
+// Query 1: Retrieve N-hop neighborhood and relations around seed entities
+CREATE OR REPLACE QUERY get_entity_subgraph(
+    SET<STRING> seed_entity_ids, 
+    INT max_hops = 2, 
+    INT max_neighbors = 15, 
+    DOUBLE min_confidence = 0.5
+) FOR GRAPH GraphScoutKG RETURNS (STRING) {
+    
+    TYPEDEF TUPLE<STRING source_id, STRING target_id, STRING rel_type, DOUBLE confidence, STRING snippet> EdgeInfo;
+    TYPEDEF TUPLE<STRING entity_id, STRING name, STRING entity_type, STRING description> VertexInfo;
+
+    ListAccum<EdgeInfo> @@edge_list;
+    SetAccum<VertexInfo> @@vertex_list;
+    SetAccum<VERTEX<Entity>> @visited;
+
+    Seeds = { Entity.* };
+    Start = SELECT s FROM Seeds:s WHERE s.entity_id IN seed_entity_ids;
+
+    Start = SELECT s FROM Start:s 
+            POST-ACCUM @@vertex_list += VertexInfo(s.entity_id, s.canonical_name, s.entity_type, s.description);
+
+    Curr = Start;
+    WHILE (Curr.size() > 0 AND max_hops > 0) DO
+        Curr = SELECT t FROM Curr:s -(RELATED_TO:e)- Entity:t
+               WHERE e.confidence >= min_confidence AND NOT t.@visited
+               SAMPLE max_neighbors TARGET
+               ACCUM 
+                   @@edge_list += EdgeInfo(s.entity_id, t.entity_id, e.relation_type, e.confidence, e.evidence_snippet),
+                   t.@visited += true
+               POST-ACCUM
+                   @@vertex_list += VertexInfo(t.entity_id, t.canonical_name, t.entity_type, t.description);
+        max_hops = max_hops - 1;
+    END;
+
+    PRINT @@vertex_list AS nodes, @@edge_list AS edges;
+}
+
+// Query 2: Retrieve backing provenance chunks for entities
+CREATE OR REPLACE QUERY get_entity_provenance(
+    SET<STRING> entity_ids,
+    INT max_chunks = 10
+) FOR GRAPH GraphScoutKG RETURNS (STRING) {
+    TYPEDEF TUPLE<STRING chunk_id, STRING text_content, STRING section_header, DOUBLE confidence> ChunkInfo;
+    ListAccum<ChunkInfo> @@chunks;
+
+    Entities = { Entity.* };
+    Selected = SELECT e FROM Entities:e WHERE e.entity_id IN entity_ids;
+
+    Chunks = SELECT c FROM Selected:e -(MENTIONED_IN:m)- Chunk:c
+             SAMPLE max_chunks TARGET
+             ACCUM @@chunks += ChunkInfo(c.chunk_id, c.text_content, c.section_header, m.confidence_score);
+
+    PRINT @@chunks AS provenance_chunks;
+}
+
+// Query 3: Detect superseded or conflicting events
+CREATE OR REPLACE QUERY detect_superseded_events(
+    SET<STRING> event_ids
+) FOR GRAPH GraphScoutKG RETURNS (STRING) {
+    TYPEDEF TUPLE<STRING newer_event_id, STRING older_event_id, STRING reason, DATETIME superseded_at> SupersedeInfo;
+    ListAccum<SupersedeInfo> @@conflicts;
+
+    Events = { Event.* };
+    Selected = SELECT ev FROM Events:ev WHERE ev.event_id IN event_ids;
+
+    Older = SELECT o FROM Selected:s -(SUPERSEDES:sup)- Event:o
+            ACCUM @@conflicts += SupersedeInfo(s.event_id, o.event_id, sup.reason, sup.superseded_at);
+
+    PRINT @@conflicts AS superseded_records;
+}
+
+INSTALL QUERY get_entity_subgraph
+INSTALL QUERY get_entity_provenance
+INSTALL QUERY detect_superseded_events

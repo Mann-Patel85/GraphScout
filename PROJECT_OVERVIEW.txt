@@ -1,0 +1,141 @@
+================================================================================
+                    GRAPHSCOUT - AGENTIC GRAPHRAG SYSTEM
+             TigerGraph Agentic GraphRAG Hackathon Submission
+================================================================================
+
+1. HACKATHON MISSION & OBJECTIVES
+--------------------------------------------------------------------------------
+* Event: TigerGraph Agentic GraphRAG Hackathon
+* Project Name: GraphScout
+* Goal: Build an autonomous, multi-agent investigation system powered by 
+  TigerGraph (Graph DB + Vector DB) that answers complex, multi-hop, and 
+  uncertain queries by decomposing questions, navigating graph relations, 
+  retrieving semantic chunks, detecting knowledge gaps, and dynamically 
+  planning retrieval steps.
+
+* The Key Differentiator & Benchmark Rule:
+  Every question must be evaluated using THREE distinct approaches side-by-side:
+  1. Standard RAG (Pure vector similarity search + single-step answer synthesis)
+  2. GraphRAG (Single-pass hybrid search combining 1-hop graph + vector chunks)
+  3. Agentic GraphRAG (GraphScout: Multi-step, orchestrator-driven autonomous loop)
+
+* Core Evaluation Metrics:
+  - Accuracy: Ground-truth alignment and factual consistency.
+  - Completeness: Retrieval coverage of all required multi-hop facts.
+  - Token Efficiency: Prompt & completion token cost and budget management.
+  - Latency: End-to-end execution speed.
+
+================================================================================
+2. WHY STANDARD RAG & STATIC GRAPHRAG FAIL
+================================================================================
+- Vector RAG struggles with multi-hop reasoning because vector similarity looks 
+  for semantic overlap rather than logical entity connectivity.
+- Static GraphRAG expands only fixed 1-hop neighborhoods and fails when queries 
+  span temporal chains (e.g., "event held immediately before 2016") or complex 
+  aggregations (e.g., "how many events had > 73 competitors?").
+- GraphScout solves this with an autonomous Orchestrator Agent that tracks a 
+  working hypothesis, actively searches for missing links, detects conflicting 
+  evidence, and traverses N-hop subgraphs dynamically until confidence is met.
+
+================================================================================
+3. SYSTEM ARCHITECTURE & COMPONENTS
+================================================================================
+GraphScout consists of five modular tiers:
+
+[1] State & Memory Harness (src/agents/state.py):
+    - InvestigationState Pydantic v2 model tracking:
+      * user_query: Original user question
+      * current_hypothesis: Working explanation refined across iterations
+      * retrieved_entities: Extracted graph nodes/vertices
+      * retrieved_subgraphs: Dynamic N-hop edges, paths, and graph topology
+      * document_chunks: Text chunks retrieved via TigerGraph Vector DB
+      * identified_gaps: Missing evidence items needed to finalize the answer
+      * step_history: Full audit log of agent actions and tool responses
+      * token_metrics: Running tally of prompt tokens, output tokens, and cost
+      * iteration_count & stopping_condition_met: Loop execution flags
+
+[2] Orchestrator Agent (src/agents/orchestrator.py):
+    - Autonomous decision loop selecting the next tool action dynamically:
+      * entity_linking: Extracts entity anchors from prompt/observations
+      * graph_traversal: Executes GSQL N-hop queries on TigerGraph
+      * vector_search: Queries TigerGraph Vector DB for dense textual context
+      * evaluate_evidence: Assesses completeness, contradictions, and gaps
+      * finish: Synthesizes final answer with citations when evidence is ready
+    - Enforces token budgeting (e.g., 16k tokens) and completeness thresholds (0.85).
+
+[3] Specialized Tools & Sub-Agents (src/agents/tools/):
+    - GraphTool (graph_tool.py): GSQL path traversals & entity linking.
+    - VectorTool (vector_tool.py): Dense semantic similarity retrieval.
+    - EvaluatorTool (evaluator_tool.py): Gap formulation & stopping conditions.
+
+[4] Database Client & Hybrid Store (src/db/tigergraph_client.py):
+    - pyTigerGraph connection wrapper with REST++ vector search endpoint.
+    - Ingest pipeline (src/db/ingest_corpus.py) mapping Wikipedia/Wikidata corpus 
+      into structured graph nodes and vector chunks.
+    - Resilient in-memory fallback engine for continuous offline local execution.
+
+[5] 3-Way Benchmarking Harness (src/evaluation/benchmark_runner.py):
+    - Compares standard_rag.py vs graph_rag.py vs agentic_rag.py.
+    - Exports structured evaluation logs to results/benchmark_report.json.
+
+================================================================================
+4. DATASET & SCHEMA SPECIFICATIONS
+================================================================================
+* Uploaded Dataset (data/):
+  - data/documents/corpus.jsonl: 2,951 Olympic event documents (~5.46M tokens)
+    containing infoboxes (games, venue, date, competitors, nations, medalists).
+  - data/eval_public.jsonl: 100 benchmark questions with verified answers.
+  - data/eval_hidden.jsonl: 50 hidden questions for competition evaluation.
+
+* TigerGraph GSQL Schema (schema/graph_schema.gsql):
+  - Vertices:
+    * Document (doc_id, title, source_url, doc_type, published_at, version)
+    * Chunk (chunk_id, chunk_index, text_content, embedding, section_header)
+    * Entity (entity_id, canonical_name, entity_type, description, aliases)
+    * Event (event_id, event_name, event_type, event_date, details)
+  - Edges:
+    * HAS_CHUNK (Document -> Chunk)
+    * MENTIONS (Chunk -> Entity)
+    * RELATED_TO (Entity -> Entity, relation_type, confidence, snippet)
+    * PARTICIPATES_IN (Entity -> Event)
+    * SUPERSEDES (Event -> Event or Document -> Document)
+  - Installed GSQL Queries:
+    * get_entity_subgraph (N-hop BFS neighborhood expansion)
+    * get_entity_provenance (Backing document chunks for entities)
+    * detect_superseded_events (Conflict & temporal contradiction detection)
+
+================================================================================
+5. HOW TO RUN & DEMO GRAPHSCOUT
+================================================================================
+
+[A] Launch Full-Stack (Backend + Frontend together):
+    Command: python run.py
+    Next.js Frontend: http://localhost:3000
+    FastAPI REST Backend: http://localhost:8000
+    OpenAPI Docs: http://localhost:8000/docs
+    Features:
+    - Investigation Studio: Real-time multi-hop agentic loop with physics-driven 
+      interactive knowledge graph (Vis-Network), audit step timeline, citation answers.
+    - 3-Way Benchmark Suite: Live side-by-side accuracy, completeness, and token 
+      analytics powered by Chart.js with downloadable JSON/CSV reports.
+    - Corpus Explorer: Instant full-text search across 2,951 Olympic documents with 
+      parsed infobox metadata.
+    - GSQL Schema Blueprint: TigerGraph schema visualizer and installed query docs.
+
+[B] Launch Backend Only:
+    Command: cd backend && ..\.venv\Scripts\python server.py
+    URL: http://localhost:8000
+
+[C] Launch Frontend Only:
+    Command: cd frontend && npm run dev
+    URL: http://localhost:3000
+
+[D] Run Single Investigation via CLI:
+    Command: cd backend && ..\.venv\Scripts\python main.py --query "Who won the gold medal in the event held at Eton Dorney on 6 to 8 August at the 2012 Summer Olympics?"
+
+[E] Run 3-Way Evaluation Benchmark:
+    Command: cd backend && ..\.venv\Scripts\python main.py --benchmark --dataset ../data/eval_public.jsonl --limit 10
+
+[F] Run Unit Tests:
+    Command: cd backend && ..\.venv\Scripts\pytest
+================================================================================

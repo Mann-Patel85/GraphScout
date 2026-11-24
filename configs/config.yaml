@@ -1,0 +1,49 @@
+app:
+  name: "GraphScout"
+  version: "1.0.0"
+  log_level: "INFO"
+  environment: "development"
+
+tigergraph:
+  host: "https://your-instance.i.tgcloud.io"
+  restpp_port: 443
+  gsport_port: 14240
+  graph_name: "GraphScoutKG"
+  username: "tigergraph"
+  password: "${TIGERGRAPH_PASSWORD:-tigergraph}"
+  secret: "${TIGERGRAPH_SECRET:-}"
+  token: "${TIGERGRAPH_TOKEN:-}"
+  use_ssl: true
+  cert_path: null
+
+vector_db:
+  embedding_model: "text-embedding-3-small"
+  embedding_dimension: 1536
+  top_k: 5
+  similarity_metric: "cosine"
+  similarity_threshold: 0.65
+
+llm:
+  provider: "openai"
+  model_name: "gpt-4o"
+  temperature: 0.1
+  max_tokens: 2048
+  api_key: "${OPENAI_API_KEY:-}"
+
+orchestrator:
+  max_iterations: 6
+  completeness_threshold: 0.85
+  max_tokens_budget: 16000
+  enable_cycle_detection: true
+  allow_speculative_hops: true
+  subgraph_max_depth: 3
+
+benchmark:
+  eval_dataset_path: "data/benchmark_questions.json"
+  output_dir: "results/benchmarks"
+  metrics:
+    - "answer_relevance"
+    - "context_recall"
+    - "token_efficiency"
+    - "latency_seconds"
+    - "hop_count"
