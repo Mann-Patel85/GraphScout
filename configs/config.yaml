@@ -4,20 +4,17 @@ app:
   log_level: "INFO"
   environment: "development"
 
-tigergraph:
-  host: "https://your-instance.i.tgcloud.io"
-  restpp_port: 443
-  gsport_port: 14240
-  graph_name: "GraphScoutKG"
-  username: "tigergraph"
-  password: "${TIGERGRAPH_PASSWORD:-tigergraph}"
-  secret: "${TIGERGRAPH_SECRET:-}"
-  token: "${TIGERGRAPH_TOKEN:-}"
-  use_ssl: true
-  cert_path: null
+# Reference only: nothing reads this file. Real settings come from environment
+# variables or backend/.env (see README).
+graph:
+  backend: "auto"            # GRAPH_BACKEND: auto | neo4j | memory
+  neo4j_uri: "neo4j+s://<instance-id>.databases.neo4j.io"   # NEO4J_URI
+  neo4j_username: "neo4j"    # NEO4J_USERNAME
+  neo4j_password: "${NEO4J_PASSWORD:-}"
+  neo4j_database: "neo4j"    # NEO4J_DATABASE
 
 vector_db:
-  embedding_model: "text-embedding-3-small"
+  embedding_model: "local-hashed-bow"   # src/utils/embeddings.py
   embedding_dimension: 1536
   top_k: 5
   similarity_metric: "cosine"

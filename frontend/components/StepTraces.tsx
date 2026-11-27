@@ -2,114 +2,143 @@
 
 import React, { useState } from "react";
 import { StepTrace } from "../lib/types";
-import { Clock, ChevronDown, ChevronRight, CheckCircle2 } from "lucide-react";
+import { formatMs } from "../lib/hooks";
+import { Badge, EmptyState, cx } from "./ui";
+import { CheckCircle2, ChevronDown, Filter, Footprints, Link2, Network, Scale, Search, type LucideIcon } from "lucide-react";
 
 interface StepTracesProps {
   steps: StepTrace[];
+  hypothesis?: string;
 }
 
-export default function StepTraces({ steps }: StepTracesProps) {
-  const [expandedSteps, setExpandedSteps] = useState<Record<number, boolean>>({ 0: true, 1: true });
+const ACTIONS: Record<string, { label: string; icon: LucideIcon; tone: "blue" | "violet" | "green" | "amber" | "cyan"; ring: string }> = {
+  entity_linking: { label: "Link entities", icon: Link2, tone: "blue", ring: "border-blue-400/40 text-blue-300" },
+  graph_traversal: { label: "Traverse graph", icon: Network, tone: "violet", ring: "border-violet-400/40 text-violet-300" },
+  vector_search: { label: "Search passages", icon: Search, tone: "green", ring: "border-emerald-400/40 text-emerald-300" },
+  find_events: { label: "Filter events", icon: Filter, tone: "cyan", ring: "border-cyan-400/40 text-cyan-300" },
+  evaluate_evidence: { label: "Evaluate evidence", icon: Scale, tone: "amber", ring: "border-amber-400/40 text-amber-300" },
+  finish: { label: "Finish", icon: CheckCircle2, tone: "cyan", ring: "border-cyan-400/40 text-cyan-300" },
+};
 
-  const toggleStep = (idx: number) => {
-    setExpandedSteps((prev) => ({ ...prev, [idx]: !prev[idx] }));
-  };
+/** "sport: Athletics", "year: 2008", "sort: competitors desc" from a find_events filter. */
+function filterChips(filter: Record<string, unknown> | undefined): string[] {
+  if (!filter) return [];
+  const chips = Object.entries(filter)
+    .filter(([k, v]) => v !== null && v !== undefined && v !== "" && !["descending", "limit", "sort_by"].includes(k))
+    .map(([k, v]) => `${k.replace(/_/g, " ")}: ${v}`);
+  if (filter.sort_by) chips.push(`sort: ${filter.sort_by} ${filter.descending === false ? "asc" : "desc"}`);
+  return chips;
+}
 
-  const badgeStyles: Record<string, { bg: string; text: string; border: string }> = {
-    entity_linking: { bg: "bg-blue-500/15", text: "text-blue-400", border: "border-blue-500/30" },
-    graph_traversal: { bg: "bg-purple-500/15", text: "text-purple-400", border: "border-purple-500/30" },
-    vector_search: { bg: "bg-emerald-500/15", text: "text-emerald-400", border: "border-emerald-500/30" },
-    evaluate_evidence: { bg: "bg-amber-500/15", text: "text-amber-400", border: "border-amber-500/30" },
-    finish: { bg: "bg-cyan-500/15", text: "text-cyan-400", border: "border-cyan-500/30" },
-  };
+function Chips({ label, items }: { label: string; items: string[] }) {
+  if (!items.length) return null;
+  return (
+    <div>
+      <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-500">{label}</div>
+      <div className="flex flex-wrap gap-1.5">
+        {items.map((it, i) => (
+          <span key={i} className="rounded-md border border-white/10 bg-slate-800/70 px-2 py-0.5 text-[12px] text-slate-200">
+            {it}
+          </span>
+        ))}
+      </div>
+    </div>
+  );
+}
 
-  if (!steps || steps.length === 0) {
-    return <p className="text-slate-500 text-sm py-4">No agent decision traces available.</p>;
+export default function StepTraces({ steps, hypothesis }: StepTracesProps) {
+  const [open, setOpen] = useState<Set<number>>(() => new Set(steps.slice(0, 1).map((s) => s.step_index)));
+
+  if (steps.length === 0) {
+    return <EmptyState icon={Footprints} title="No agent steps recorded" />;
   }
 
+  const allOpen = open.size === steps.length;
+  const toggle = (i: number) =>
+    setOpen((prev) => {
+      const next = new Set(prev);
+      if (next.has(i)) next.delete(i);
+      else next.add(i);
+      return next;
+    });
+
   return (
-    <div className="space-y-3">
-      {steps.map((step) => {
-        const isExpanded = !!expandedSteps[step.step_index];
-        const style = badgeStyles[step.action_taken] || {
-          bg: "bg-slate-700/30",
-          text: "text-slate-300",
-          border: "border-slate-600/30",
-        };
+    <div className="space-y-4">
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-xs text-slate-500">Each step is a decision by the orchestrator LLM, followed by the tool it chose.</p>
+        <button
+          onClick={() => setOpen(allOpen ? new Set() : new Set(steps.map((s) => s.step_index)))}
+          className="shrink-0 rounded px-2 py-1 text-xs font-medium text-slate-400 hover:bg-white/5 hover:text-slate-200"
+        >
+          {allOpen ? "Collapse all" : "Expand all"}
+        </button>
+      </div>
 
-        return (
-          <div
-            key={step.step_index}
-            className="border border-white/10 rounded-xl bg-slate-900/40 overflow-hidden transition-all hover:border-cyan-500/30"
-          >
-            {/* Step Header */}
-            <button
-              onClick={() => toggleStep(step.step_index)}
-              className="w-full px-5 py-3.5 flex items-center justify-between text-left hover:bg-white/[0.02]"
-            >
-              <div className="flex items-center gap-3">
-                <span
-                  className={`px-2.5 py-1 rounded text-xs font-bold uppercase tracking-wider border ${style.bg} ${style.text} ${style.border}`}
+      <ol className="relative space-y-3 before:absolute before:bottom-4 before:left-[15px] before:top-4 before:w-px before:bg-white/10">
+        {steps.map((step) => {
+          const meta = ACTIONS[step.action_taken] ?? { label: step.action_taken, icon: Footprints, tone: "cyan" as const, ring: "border-white/20 text-slate-300" };
+          const Icon = meta.icon;
+          const isOpen = open.has(step.step_index);
+          const inputs = step.tool_inputs ?? {};
+          const queries = step.action_taken === "vector_search" ? (inputs.search_queries ?? []) : [];
+          const seeds = step.action_taken === "graph_traversal" ? (inputs.seed_entities ?? []) : [];
+          const filters = step.action_taken === "find_events" ? filterChips(inputs.event_filter) : [];
+          const skipped = step.reasoning.startsWith("[Repeated step skipped]");
+
+          return (
+            <li key={step.step_index} className="relative pl-11">
+              <span className={cx("absolute left-0 top-2 flex h-8 w-8 items-center justify-center rounded-full border bg-[#0b1120]", meta.ring)}>
+                <Icon className="h-4 w-4" aria-hidden />
+              </span>
+
+              <div className="overflow-hidden rounded-xl border border-white/10 bg-slate-900/40 transition-colors hover:border-white/20">
+                <button
+                  onClick={() => toggle(step.step_index)}
+                  aria-expanded={isOpen}
+                  className="flex w-full items-center gap-3 px-4 py-3 text-left"
                 >
-                  Step {step.step_index}: {step.action_taken.replace("_", " ")}
-                </span>
-                <span className="text-sm font-semibold text-slate-200 line-clamp-1">
-                  {step.reasoning}
-                </span>
-              </div>
+                  <span className="shrink-0 font-mono text-[11px] text-slate-500">#{step.step_index}</span>
+                  <Badge tone={meta.tone}>{meta.label}</Badge>
+                  <span className="min-w-0 flex-1 truncate text-sm text-slate-300">{step.tool_outputs_summary || step.reasoning}</span>
+                  <span className="hidden shrink-0 font-mono text-[11px] text-slate-500 sm:inline">{formatMs(step.duration_ms)}</span>
+                  <ChevronDown className={cx("h-4 w-4 shrink-0 text-slate-500 transition-transform", isOpen && "rotate-180")} aria-hidden />
+                </button>
 
-              <div className="flex items-center gap-4 text-xs font-mono text-slate-400 shrink-0">
-                <span className="flex items-center gap-1">
-                  <Clock className="w-3.5 h-3.5" />
-                  {step.duration_ms.toFixed(1)}ms
-                </span>
-                {isExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
-              </div>
-            </button>
-
-            {/* Step Expanded Content */}
-            {isExpanded && (
-              <div className="px-5 py-4 border-t border-white/10 bg-slate-950/40 text-xs space-y-3">
-                <div>
-                  <div className="text-[11px] font-bold uppercase tracking-wider text-slate-400 mb-1">
-                    Orchestrator Reasoning Narrative
-                  </div>
-                  <p className="text-slate-300 leading-relaxed font-sans">{step.reasoning}</p>
-                </div>
-
-                {step.tool_outputs_summary && (
-                  <div>
-                    <div className="text-[11px] font-bold uppercase tracking-wider text-slate-400 mb-1">
-                      Tool Execution Summary
+                {isOpen && (
+                  <div className="space-y-3 border-t border-white/10 bg-slate-950/40 px-4 py-3.5 text-sm animate-fade-in">
+                    <div>
+                      <div className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-slate-500">Why</div>
+                      <p className={cx("leading-relaxed", skipped ? "text-amber-200/90" : "text-slate-300")}>{step.reasoning}</p>
                     </div>
-                    <div className="font-mono text-slate-300 bg-slate-900/80 p-2.5 rounded border border-white/5 whitespace-pre-wrap">
-                      {step.tool_outputs_summary}
-                    </div>
-                  </div>
-                )}
-
-                {step.entities_discovered && step.entities_discovered.length > 0 && (
-                  <div>
-                    <div className="text-[11px] font-bold uppercase tracking-wider text-slate-400 mb-1">
-                      Discovered Entities
-                    </div>
-                    <div className="flex flex-wrap gap-1.5">
-                      {step.entities_discovered.map((ent, i) => (
-                        <span
-                          key={i}
-                          className="px-2 py-0.5 rounded text-[11px] font-semibold bg-cyan-500/10 text-cyan-300 border border-cyan-500/20"
-                        >
-                          🔗 {ent}
-                        </span>
-                      ))}
-                    </div>
+                    <Chips label="Search queries" items={queries} />
+                    <Chips label="Event filters" items={filters} />
+                    <Chips label={`Seed entities${inputs.max_hops ? ` · ${inputs.max_hops} hops` : ""}`} items={seeds} />
+                    {step.tool_outputs_summary && (
+                      <div>
+                        <div className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-slate-500">Result</div>
+                        <p className="rounded-md border border-white/5 bg-slate-900/80 px-3 py-2 font-mono text-[12px] text-slate-300">{step.tool_outputs_summary}</p>
+                      </div>
+                    )}
+                    {step.entities_discovered.length > 0 && (
+                      <Chips
+                        label={`Entities found (${step.entities_discovered.length})`}
+                        items={step.entities_discovered.slice(0, 20).concat(step.entities_discovered.length > 20 ? [`+${step.entities_discovered.length - 20} more`] : [])}
+                      />
+                    )}
                   </div>
                 )}
               </div>
-            )}
-          </div>
-        );
-      })}
+            </li>
+          );
+        })}
+      </ol>
+
+      {hypothesis && !hypothesis.startsWith("Initial hypothesis") && (
+        <div className="rounded-xl border border-white/10 bg-slate-900/40 p-4">
+          <div className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-slate-500">Final working hypothesis</div>
+          <p className="text-sm leading-relaxed text-slate-300">{hypothesis}</p>
+        </div>
+      )}
     </div>
   );
 }

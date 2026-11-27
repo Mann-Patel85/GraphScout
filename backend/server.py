@@ -18,6 +18,12 @@ BACKEND_DIR = Path(__file__).resolve().parent
 if str(BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(BACKEND_DIR))
 
+try:  # Load LLM keys / NEO4J_* from a .env file if one exists
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 console = Console()
 
 
@@ -32,7 +38,7 @@ def main() -> None:
     console.print(
         Panel.fit(
             f"[bold cyan]GraphScout 🧭⚡ Backend Server[/bold cyan]\n"
-            f"[dim]Autonomous Multi-Agent GraphRAG System on TigerGraph[/dim]\n\n"
+            f"[dim]Autonomous Multi-Agent GraphRAG System[/dim]\n\n"
             f"⚡ [bold cyan]REST API:[/bold cyan]            [link={url}]{url}[/link]\n"
             f"📑 [bold yellow]Interactive API Docs:[/bold yellow] [link={url}/docs]{url}/docs[/link]\n\n"
             f"[dim]Press Ctrl+C to stop server[/dim]",

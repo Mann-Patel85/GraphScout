@@ -15,7 +15,8 @@ def test_status_endpoint(client):
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "online"
-    assert "tigergraph" in data
+    assert data["graph"]["backend"] == "memory"  # tests never configure Neo4j
+    assert data["graph"]["indexed_chunks"] > 0
     assert "datasets" in data
     assert data["datasets"]["corpus_documents"] > 0
 
@@ -33,12 +34,11 @@ def test_schema_endpoint(client):
     response = client.get("/api/schema")
     assert response.status_code == 200
     data = response.json()
-    assert data["schema_name"] == "GraphScoutKG"
-    assert len(data["vertices"]) == 4
-    assert len(data["edges"]) == 5
-    assert len(data["installed_queries"]) == 3
-    assert "gsql_code" in data
-    assert len(data["gsql_code"]) > 50
+    assert data["language"] == "cypher"
+    assert [n["name"] for n in data["nodes"]] == ["Entity", "Chunk"]
+    assert [r["name"] for r in data["relationships"]] == ["RELATED_TO", "MENTIONS"]
+    assert [q["name"] for q in data["queries"]] == ["expand_hop", "provenance", "find_events", "vector_search"]
+    assert "CREATE VECTOR INDEX" in data["code"]
 
 
 def test_corpus_endpoints(client):

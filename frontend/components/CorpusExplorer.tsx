@@ -1,142 +1,170 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { CorpusDocDetail, CorpusDocSummary } from "../lib/types";
-import { getCorpusDocuments, getCorpusDocDetail, ingestCorpus } from "../lib/api";
+import { getCorpusDocDetail, getCorpusDocuments } from "../lib/api";
+import { splitInfobox } from "../lib/text";
 import DocumentModal from "./DocumentModal";
-import { Search, RotateCw, BookOpen, ExternalLink, Hash, Check } from "lucide-react";
+import { Button, Callout, Card, EmptyState, PageHeader, Skeleton } from "./ui";
+import { BookOpen, Loader2, Search, SearchX, X } from "lucide-react";
 
-export default function CorpusExplorer() {
+const PAGE_SIZE = 24;
+
+/** Card snippet: "venue · games · date" from the infobox when present, else the raw text. */
+function snippetText(snippet: string): string {
+  const { fields, body } = splitInfobox(snippet);
+  if (!fields.length) return body;
+  const get = (k: string) => fields.find(([key]) => key === k)?.[1];
+  return [get("venue"), get("games") && `${get("games")} Games`, get("date") ?? get("dates"), get("competitors") && `${get("competitors")} competitors`]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+export default function CorpusExplorer({ totalDocs }: { totalDocs?: number }) {
   const [searchTerm, setSearchTerm] = useState("");
   const [documents, setDocuments] = useState<CorpusDocSummary[]>([]);
   const [total, setTotal] = useState(0);
-  const [isLoading, setIsLoading] = useState(false);
-  const [isIngesting, setIsIngesting] = useState(false);
-  const [ingestSuccess, setIngestSuccess] = useState<string | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [isLoadingMore, setIsLoadingMore] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [openingId, setOpeningId] = useState<string | null>(null);
   const [selectedDoc, setSelectedDoc] = useState<CorpusDocDetail | null>(null);
+  const requestId = useRef(0);
 
+  // Debounced search; responses from superseded requests are ignored.
   useEffect(() => {
-    const delayDebounce = setTimeout(() => {
-      fetchDocs(searchTerm);
-    }, 300);
-
-    return () => clearTimeout(delayDebounce);
+    const id = ++requestId.current;
+    setIsLoading(true);
+    const t = setTimeout(async () => {
+      try {
+        const res = await getCorpusDocuments(searchTerm.trim(), PAGE_SIZE, 0);
+        if (id !== requestId.current) return;
+        setDocuments(res.documents);
+        setTotal(res.total);
+        setError(null);
+      } catch (err) {
+        if (id === requestId.current) setError((err as Error).message);
+      } finally {
+        if (id === requestId.current) setIsLoading(false);
+      }
+    }, 250);
+    return () => clearTimeout(t);
   }, [searchTerm]);
 
-  const fetchDocs = async (q: string) => {
-    setIsLoading(true);
+  const loadMore = async () => {
+    setIsLoadingMore(true);
     try {
-      const res = await getCorpusDocuments(q, 24, 0);
-      setDocuments(res.documents);
+      const res = await getCorpusDocuments(searchTerm.trim(), PAGE_SIZE, documents.length);
+      setDocuments((prev) => [...prev, ...res.documents]);
       setTotal(res.total);
     } catch (err) {
-      console.error(err);
+      setError((err as Error).message);
     } finally {
-      setIsLoading(false);
+      setIsLoadingMore(false);
     }
   };
 
-  const handleDocClick = async (docId: string) => {
+  const openDoc = async (docId: string) => {
+    setOpeningId(docId);
     try {
-      const doc = await getCorpusDocDetail(docId);
-      setSelectedDoc(doc);
+      setSelectedDoc(await getCorpusDocDetail(docId));
     } catch (err) {
-      console.error(err);
-    }
-  };
-
-  const handleIngest = async () => {
-    setIsIngesting(true);
-    setIngestSuccess(null);
-    try {
-      const res = await ingestCorpus(100);
-      setIngestSuccess(`Ingested ${res.docs_ingested} docs into TigerGraph in ${res.duration_seconds}s!`);
-      setTimeout(() => setIngestSuccess(null), 4000);
-    } catch (err: any) {
-      console.error(err);
+      setError((err as Error).message);
     } finally {
-      setIsIngesting(false);
+      setOpeningId(null);
     }
   };
 
   return (
     <div className="space-y-6">
-      {/* Header */}
-      <div>
-        <h1 className="text-2xl font-black tracking-tight text-white flex items-center gap-2">
-          Olympic Corpus &amp; Document Index <BookOpen className="w-5 h-5 text-cyan-400" />
-        </h1>
-        <p className="text-slate-400 text-sm mt-1">
-          Explore and inspect the 2,951 Olympic event documents with infoboxes, dates, competitors, and medalists indexed in TigerGraph.
-        </p>
-      </div>
+      <PageHeader
+        icon={BookOpen}
+        title="Corpus"
+        description={`The ${totalDocs ? totalDocs.toLocaleString() : ""} source documents the agent retrieves from: Olympic event articles with infoboxes (venue, dates, competitors, medalists) that are turned into graph entities and links.`}
+      />
 
-      {/* Search & Ingest Toolbar */}
-      <div className="bg-[#0f172a]/80 border border-white/10 rounded-2xl p-4 shadow-xl backdrop-blur-md flex flex-col sm:flex-row gap-3">
-        <div className="relative flex-1">
-          <Search className="w-5 h-5 text-slate-400 absolute left-4 top-3" />
+      <Card className="py-4">
+        <div className="relative">
+          <Search className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" aria-hidden />
           <input
-            type="text"
+            type="search"
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
-            placeholder="Search articles by title, event, venue, or keywords..."
-            className="w-full pl-11 pr-4 py-2.5 bg-slate-900 border border-white/10 rounded-xl text-slate-100 placeholder-slate-500 text-sm focus:outline-none focus:border-cyan-400 focus:ring-2 focus:ring-cyan-400/20"
+            placeholder="Search by title, venue, athlete or keyword…"
+            aria-label="Search the corpus"
+            className="field h-11 pl-10 pr-10"
           />
-        </div>
-
-        <button
-          onClick={handleIngest}
-          disabled={isIngesting}
-          className="px-4 py-2.5 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-white/10 text-xs font-semibold flex items-center justify-center gap-2 disabled:opacity-50 shrink-0"
-        >
-          <RotateCw className={`w-3.5 h-3.5 ${isIngesting ? "animate-spin text-cyan-400" : ""}`} />
-          <span>{isIngesting ? "Ingesting Documents..." : "Ingest Sample Corpus"}</span>
-        </button>
-      </div>
-
-      {ingestSuccess && (
-        <div className="p-3 rounded-lg bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 text-xs flex items-center gap-2">
-          <Check className="w-4 h-4" />
-          <span>{ingestSuccess}</span>
-        </div>
-      )}
-
-      {/* Grid of Documents */}
-      {isLoading ? (
-        <div className="text-slate-500 text-sm py-12 text-center">Searching corpus...</div>
-      ) : documents.length === 0 ? (
-        <div className="text-slate-500 text-sm py-12 text-center">No matching documents found.</div>
-      ) : (
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          {documents.map((doc) => (
-            <div
-              key={doc.doc_id}
-              onClick={() => handleDocClick(doc.doc_id)}
-              className="bg-[#0f172a]/60 hover:bg-[#0f172a] border border-white/10 hover:border-cyan-400/40 rounded-xl p-4 cursor-pointer transition-all flex flex-col justify-between group shadow-lg"
+          {searchTerm && (
+            <button
+              onClick={() => setSearchTerm("")}
+              className="absolute right-2.5 top-1/2 -translate-y-1/2 rounded p-1 text-slate-500 hover:bg-white/5 hover:text-slate-200"
+              aria-label="Clear search"
             >
-              <div>
-                <div className="flex items-center justify-between text-[11px] font-mono text-cyan-400 font-bold mb-1">
-                  <span>{doc.doc_id}</span>
-                  <span className="text-slate-500">~{doc.approx_tokens} tokens</span>
-                </div>
-                <h4 className="font-bold text-slate-100 text-sm line-clamp-1 group-hover:text-cyan-300 transition-colors">
-                  {doc.title}
-                </h4>
-                <p className="text-xs text-slate-400 line-clamp-3 mt-1.5 leading-relaxed">
-                  {doc.snippet}
-                </p>
-              </div>
+              <X className="h-4 w-4" />
+            </button>
+          )}
+        </div>
+        <p className="mt-2 text-xs text-slate-500" aria-live="polite">
+          {isLoading ? "Searching…" : `${total.toLocaleString()} document${total === 1 ? "" : "s"}${searchTerm ? ` matching "${searchTerm.trim()}"` : ""}`}
+        </p>
+      </Card>
 
-              <div className="mt-3 pt-2.5 border-t border-white/5 flex items-center justify-between text-[11px] font-semibold text-slate-500 group-hover:text-cyan-400">
-                <span>Inspect Document</span>
-                <span>&rarr;</span>
-              </div>
+      {error && <Callout tone="red">{error}</Callout>}
+
+      {isLoading ? (
+        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          {Array.from({ length: 6 }).map((_, i) => (
+            <div key={i} className="space-y-3 rounded-xl border border-white/10 bg-surface/50 p-4">
+              <Skeleton className="h-3 w-24" />
+              <Skeleton className="h-4 w-4/5" />
+              <Skeleton className="h-3 w-full" />
+              <Skeleton className="h-3 w-2/3" />
             </div>
           ))}
         </div>
+      ) : documents.length === 0 ? (
+        <Card padded={false}>
+          <EmptyState icon={SearchX} title="No matching documents">
+            Try a venue (&quot;Eton Dorney&quot;), a Games (&quot;2012 Summer&quot;) or an athlete name.
+          </EmptyState>
+        </Card>
+      ) : (
+        <>
+          <ul className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+            {documents.map((doc) => (
+              <li key={doc.doc_id}>
+                <button
+                  onClick={() => openDoc(doc.doc_id)}
+                  className="group flex h-full w-full flex-col rounded-xl border border-white/10 bg-surface/50 p-4 text-left transition-all hover:border-cyan-400/40 hover:bg-surface"
+                >
+                  <div className="mb-1.5 flex items-center justify-between gap-2 text-[11px]">
+                    <span className="font-mono text-slate-500">{doc.doc_id}</span>
+                    {openingId === doc.doc_id ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin text-cyan-400" aria-label="Opening" />
+                    ) : (
+                      <span className="text-slate-600">~{doc.approx_tokens.toLocaleString()} tok</span>
+                    )}
+                  </div>
+                  <h3 className="line-clamp-2 text-sm font-semibold leading-snug text-slate-100 group-hover:text-cyan-200">{doc.title}</h3>
+                  <p className="mt-2 line-clamp-3 text-xs leading-relaxed text-slate-400">{snippetText(doc.snippet)}</p>
+                </button>
+              </li>
+            ))}
+          </ul>
+
+          {documents.length < total && (
+            <div className="flex flex-col items-center gap-2">
+              <Button onClick={loadMore} loading={isLoadingMore}>
+                Load more
+              </Button>
+              <span className="text-xs text-slate-500">
+                Showing {documents.length.toLocaleString()} of {total.toLocaleString()}
+              </span>
+            </div>
+          )}
+        </>
       )}
 
-      {/* Modal Drawer */}
       <DocumentModal doc={selectedDoc} onClose={() => setSelectedDoc(null)} />
     </div>
   );

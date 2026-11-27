@@ -6,10 +6,10 @@ Implements single-pass hybrid Graph + Vector retrieval without iterative agentic
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List
-from pydantic import BaseModel
+from typing import Optional
+from pydantic import BaseModel, Field
 
-from src.db.tigergraph_client import TigerGraphClient
+from src.db.graph_client import GraphClient
 from src.utils.llm_client import LLMClient
 from src.agents.tools.graph_tool import GraphTool
 
@@ -24,15 +24,17 @@ class GraphRAGResult(BaseModel):
     completion_tokens: int
     total_tokens: int
     latency_seconds: float
-    accuracy_score: float = 0.82
-    completeness_score: float = 0.78
+    # Filled in by the benchmark runner against ground truth (None = not scored).
+    accuracy_score: Optional[float] = None
+    completeness_score: Optional[float] = None
     pipeline_type: str = "graph_rag"
+    retrieved_context: str = Field(default="", exclude=True)
 
 
 class GraphRAGPipeline:
     """One-shot Static Graph + Vector RAG Pipeline."""
 
-    def __init__(self, tg_client: TigerGraphClient, llm_client: LLMClient, max_hops: int = 1, top_k_chunks: int = 3):
+    def __init__(self, tg_client: GraphClient, llm_client: LLMClient, max_hops: int = 1, top_k_chunks: int = 3):
         self.tg_client = tg_client
         self.llm = llm_client
         self.max_hops = max_hops
@@ -54,11 +56,12 @@ class GraphRAGPipeline:
 
         # Step 3: Vector retrieval
         embedding = self.llm.get_embedding(query)
-        chunks = self.tg_client.vector_search(embedding, top_k=self.top_k_chunks)
+        chunks = self.tg_client.vector_search(embedding, top_k=self.top_k_chunks, query_text=query)
         prompt_tokens += len(query.split()) * 2
 
         # Step 4: Single-pass synthesis
         graph_text = "\n".join([f"- {e.source_id} -[{e.relation_type}]-> {e.target_id}" for e in subgraph.edges])
+        nodes_text = "\n".join([f"- {n.canonical_name} ({n.entity_type})" for n in subgraph.nodes])
         chunks_text = "\n\n".join([f"[{c.chunk_id}] {c.text_content}" for c in chunks])
 
         system_prompt = "You are a GraphRAG expert. Answer the query using both graph relationships and document chunks."
@@ -80,4 +83,5 @@ class GraphRAGPipeline:
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
             latency_seconds=latency,
+            retrieved_context="\n".join([nodes_text, graph_text, chunks_text]),
         )

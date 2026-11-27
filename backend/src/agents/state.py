@@ -17,6 +17,7 @@ class AgentActionType(str, Enum):
     ENTITY_LINKING = "entity_linking"
     GRAPH_TRAVERSAL = "graph_traversal"
     VECTOR_SEARCH = "vector_search"
+    FIND_EVENTS = "find_events"
     EVALUATE_EVIDENCE = "evaluate_evidence"
     FINISH = "finish"
 
@@ -157,6 +158,9 @@ class InvestigationState(BaseModel):
 
     # 3. Vector / Unstructured Document Chunks
     document_chunks: Dict[str, DocumentChunk] = Field(default_factory=dict)
+
+    # 3b. Structured event-query results (find_events tables, exact counts)
+    event_findings: List[str] = Field(default_factory=list)
 
     # 4. Gaps & Audit Trace
     identified_gaps: List[KnowledgeGap] = Field(default_factory=list)

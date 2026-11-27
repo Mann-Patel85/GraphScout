@@ -1,5 +1,5 @@
-"""Database and TigerGraph Connectors."""
+"""Graph database backends (Neo4j and in-memory)."""
 
-from src.db.tigergraph_client import TigerGraphClient, TigerGraphConfig
+from src.db.graph_client import GraphClient, create_graph_client
 
-__all__ = ["TigerGraphClient", "TigerGraphConfig"]
+__all__ = ["GraphClient", "create_graph_client"]

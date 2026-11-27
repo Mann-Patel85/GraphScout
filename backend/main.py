@@ -12,49 +12,26 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.tree import Tree
 
+try:  # Load LLM keys / NEO4J_* from a .env file if one exists
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 from src.agents.orchestrator import OrchestratorAgent
 from src.agents.state import GraphScoutState
-from src.db.tigergraph_client import TigerGraphClient, TigerGraphConfig
+from src.db.graph_client import create_graph_client
 from src.evaluation.benchmark_runner import BenchmarkRunner
 from src.utils.llm_client import LLMClient
 
 console = Console()
 
 
-def seed_mock_data(tg_client: TigerGraphClient) -> None:
-    """Populate initial entities from corpus or fallback fixtures."""
-    from pathlib import Path
-
-    corpus_path = Path("data/documents/corpus.jsonl")
-    if not corpus_path.exists():
-        corpus_path = Path(__file__).resolve().parent.parent / "data/documents/corpus.jsonl"
-    if corpus_path.exists():
-        # Auto-load documents from user-provided corpus
-        tg_client.load_local_corpus(str(corpus_path), max_docs=1000)
-    else:
-        from src.agents.state import DocumentChunk, EntityNode, EntityRelation
-        e1 = EntityNode(
-            entity_id="Company_Alpha",
-            canonical_name="Company Alpha",
-            entity_type="Organization",
-            description="Autonomous AI robotics manufacturer.",
-        )
-        e2 = EntityNode(
-            entity_id="Project_Titan",
-            canonical_name="Project Titan",
-            entity_type="Project",
-            description="High-density battery technology initiative.",
-        )
-        tg_client.upsert_entity(e1)
-        tg_client.upsert_entity(e2)
-
-
 def run_investigation(query: str) -> None:
     """Run GraphScout Orchestrator on a user query."""
     console.print(Panel(f"[bold cyan]Query:[/bold cyan] {query}", title="GraphScout Autonomous Investigation"))
     
-    tg_client = TigerGraphClient()
-    seed_mock_data(tg_client)
+    tg_client = create_graph_client()
 
     llm_client = LLMClient()
     orchestrator = OrchestratorAgent(tg_client=tg_client, llm_client=llm_client)
@@ -83,8 +60,7 @@ def run_benchmark(dataset_path: str = "data/eval_public.jsonl", limit: int = 10)
     import json
     from pathlib import Path
 
-    tg_client = TigerGraphClient()
-    seed_mock_data(tg_client)
+    tg_client = create_graph_client()
 
     runner = BenchmarkRunner(tg_client=tg_client)
     
@@ -114,7 +90,7 @@ def run_benchmark(dataset_path: str = "data/eval_public.jsonl", limit: int = 10)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="GraphScout - Agentic GraphRAG System on TigerGraph")
+    parser = argparse.ArgumentParser(description="GraphScout - Agentic GraphRAG System")
     parser.add_argument("--query", type=str, help="Run single agentic investigation on user query")
     parser.add_argument("--benchmark", action="store_true", help="Run 3-way benchmarking harness")
     parser.add_argument("--dataset", type=str, default="data/eval_public.jsonl", help="Dataset file path for benchmark")

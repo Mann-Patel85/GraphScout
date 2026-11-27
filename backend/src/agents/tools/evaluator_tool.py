@@ -24,6 +24,7 @@ class EvaluatorTool:
         subgraph: SubgraphData,
         chunks: Dict[str, DocumentChunk],
         identified_gaps: List[KnowledgeGap],
+        event_findings: str = "None",
     ) -> Tuple[EvaluationVerdict, Dict[str, int]]:
         """Evaluate whether current evidence is sufficient to decisively answer the user query."""
         system_prompt = (
@@ -48,6 +49,9 @@ ACCUMULATED GRAPH NODES:
 
 ACCUMULATED GRAPH EDGES:
 {chr(10).join(edges_summary) if edges_summary else "No graph relations discovered yet."}
+
+STRUCTURED EVENT RESULTS (exact; computed over every event in the corpus):
+{event_findings}
 
 DOCUMENT CHUNK SNIPPETS:
 {chr(10).join(chunks_summary) if chunks_summary else "No text chunks retrieved yet."}

@@ -10,7 +10,7 @@ from src.agents.state import (
     SubgraphData,
 )
 from src.agents.orchestrator import OrchestratorAgent
-from src.db.tigergraph_client import TigerGraphClient
+from src.db.memory_graph import InMemoryGraphClient
 from src.utils.llm_client import LLMClient
 from src.pipelines.standard_rag import StandardRAGPipeline
 from src.pipelines.graph_rag import GraphRAGPipeline
@@ -19,7 +19,7 @@ from src.pipelines.agentic_rag import AgenticRAGPipeline
 
 @pytest.fixture
 def tg_client():
-    client = TigerGraphClient()
+    client = InMemoryGraphClient()
     # Seed sample entities
     e1 = EntityNode(entity_id="Company_A", canonical_name="Company A", entity_type="Org")
     e2 = EntityNode(entity_id="Company_B", canonical_name="Company B", entity_type="Org")

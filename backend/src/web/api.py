@@ -1,7 +1,7 @@
 """GraphScout Modern Web Backend API.
 
 FastAPI REST endpoints for autonomous agentic graph investigations,
-3-way benchmark comparisons, corpus inspection, and TigerGraph knowledge schema.
+3-way benchmark comparisons, corpus inspection, and the graph schema.
 """
 
 from __future__ import annotations
@@ -21,9 +21,10 @@ from pydantic import BaseModel, Field
 
 from src.agents.orchestrator import OrchestratorAgent
 from src.agents.state import InvestigationState
-from src.db.tigergraph_client import TigerGraphClient, TigerGraphConfig
+from src.db.graph_client import GraphClient, create_graph_client
 from src.evaluation.benchmark_runner import BenchmarkRunner
-from src.utils.llm_client import LLMClient
+from src.evaluation.metrics import extract_ground_truth
+from src.utils.llm_client import LLMClient, available_models
 
 logger = logging.getLogger("GraphScout.WebAPI")
 
@@ -31,28 +32,23 @@ logger = logging.getLogger("GraphScout.WebAPI")
 def find_project_root() -> Path:
     current = Path(__file__).resolve().parent
     for _ in range(6):
-        if (current / "data").exists() and (current / "schema").exists():
+        if (current / "data").exists() and (current / "backend").exists():
             return current
         current = current.parent
     return Path(__file__).resolve().parent.parent.parent.parent
 
 PROJECT_ROOT = find_project_root()
 DATA_DIR = PROJECT_ROOT / "data"
-SCHEMA_DIR = PROJECT_ROOT / "schema"
 
 # Global client cache
-_tg_client_instance: Optional[TigerGraphClient] = None
+_tg_client_instance: Optional[GraphClient] = None
 
 
-def get_tg_client() -> TigerGraphClient:
-    """Retrieve or initialize singleton TigerGraphClient with loaded corpus."""
+def get_tg_client() -> GraphClient:
+    """Shared graph client: Neo4j when configured, else the in-memory graph loaded from the corpus."""
     global _tg_client_instance
     if _tg_client_instance is None:
-        client = TigerGraphClient()
-        corpus_file = DATA_DIR / "documents" / "corpus.jsonl"
-        if corpus_file.exists():
-            client.load_local_corpus(str(corpus_file), max_docs=1000)
-        _tg_client_instance = client
+        _tg_client_instance = create_graph_client()
     return _tg_client_instance
 
 
@@ -62,7 +58,7 @@ def get_tg_client() -> TigerGraphClient:
 
 class InvestigateRequest(BaseModel):
     query: str = Field(..., description="The query to investigate")
-    model: str = Field(default="gpt-4o", description="LLM model identifier")
+    model: Optional[str] = Field(default=None, description="LLM model id (see /api/models); provider default if omitted")
     temperature: float = Field(default=0.1, ge=0.0, le=1.0)
     max_hops: int = Field(default=6, ge=2, le=12, description="Max orchestrator reasoning hops")
     completeness_threshold: float = Field(default=0.85, ge=0.5, le=1.0)
@@ -72,7 +68,7 @@ class InvestigateRequest(BaseModel):
 class BenchmarkRequest(BaseModel):
     dataset: str = Field(default="public", description="'public' (100 Qs) or 'hidden' (50 Qs) or 'sample'")
     limit: int = Field(default=3, ge=1, le=50, description="Number of questions to evaluate")
-    model: str = Field(default="gpt-4o")
+    model: Optional[str] = Field(default=None)
     temperature: float = Field(default=0.1)
 
 
@@ -86,7 +82,7 @@ class IngestRequest(BaseModel):
 
 app = FastAPI(
     title="GraphScout API",
-    description="Autonomous Multi-Agent GraphRAG System on TigerGraph",
+    description="Autonomous Multi-Agent GraphRAG System",
     version="2.0.0",
 )
 
@@ -107,6 +103,7 @@ app.add_middleware(
 async def get_system_status() -> Dict[str, Any]:
     """Return live system health, database connection state, and dataset stats."""
     tg = get_tg_client()
+    graph_stats = await asyncio.to_thread(tg.stats)
     corpus_path = DATA_DIR / "documents" / "corpus.jsonl"
     eval_pub_path = DATA_DIR / "eval_public.jsonl"
     eval_hid_path = DATA_DIR / "eval_hidden.jsonl"
@@ -130,24 +127,32 @@ async def get_system_status() -> Dict[str, Any]:
 
     return {
         "status": "online",
-        "engine": "TigerGraph Hybrid Graph + Vector DB",
-        "tigergraph": {
-            "host": tg.config.host,
-            "graph_name": tg.config.graph_name,
-            "mock_mode": tg._mock_mode,
-            "connected": tg.conn is not None or tg._mock_mode,
-            "mode_label": "In-Memory Hybrid Simulation" if tg._mock_mode else "Live TigerGraph Cluster",
-            "indexed_entities": len(tg._mock_vertices.get("Entity", {})),
-            "indexed_chunks": len(tg._mock_vertices.get("Chunk", {})),
+        "engine": f"{tg.mode_label} graph + vector search",
+        "graph": {
+            "backend": tg.backend,
+            "label": tg.mode_label,
+            "persistent": tg.persistent,
+            "location": tg.location,
+            "database": tg.database,
+            "indexed_entities": graph_stats["entities"],
+            "indexed_relations": graph_stats["relations"],
+            "indexed_chunks": graph_stats["chunks"],
         },
+        "llm": available_models(),
         "datasets": {
             "corpus_documents": corpus_count,
-            "corpus_file": str(corpus_path.relative_to(PROJECT_ROOT)) if corpus_path.exists() else None,
+            "corpus_file": corpus_path.relative_to(PROJECT_ROOT).as_posix() if corpus_path.exists() else None,
             "eval_public_questions": eval_pub_count,
             "eval_hidden_questions": eval_hid_count,
             "sample_questions_available": sample_q_path.exists(),
         },
     }
+
+
+@app.get("/api/models")
+async def get_models() -> Dict[str, Any]:
+    """Active LLM provider and the models the UI may offer."""
+    return available_models()
 
 
 @app.get("/api/presets")
@@ -201,7 +206,7 @@ async def get_preset_queries() -> List[Dict[str, Any]]:
 
 @app.post("/api/investigate")
 async def run_investigation(req: InvestigateRequest) -> Dict[str, Any]:
-    """Execute autonomous agentic investigation on TigerGraph."""
+    """Execute an autonomous agentic investigation over the graph."""
     query = req.query.strip()
     if not query:
         raise HTTPException(status_code=400, detail="Query string cannot be empty")
@@ -286,7 +291,8 @@ async def run_investigation(req: InvestigateRequest) -> Dict[str, Any]:
             "associated_entities": chk.associated_entities,
         })
 
-    comp_score = state.evaluation.completeness_score if state.evaluation else 0.92
+    # Evaluator agent's self-assessed completeness; 0 when no evaluation step ran.
+    comp_score = state.evaluation.completeness_score if state.evaluation else 0.0
 
     return {
         "query": query,
@@ -314,6 +320,12 @@ async def run_investigation(req: InvestigateRequest) -> Dict[str, Any]:
         "chunks": chunks_data,
         "citation_references": state.citation_references,
         "stopping_condition_met": state.stopping_condition_met,
+        "llm": {
+            "provider": llm_client.provider_name,
+            "model": llm_client.model_name,
+            "live": llm_client.is_live,
+            "fallback_calls": llm_client.fallback_calls,
+        },
     }
 
 
@@ -348,36 +360,40 @@ async def run_benchmark_endpoint(req: BenchmarkRequest) -> Dict[str, Any]:
     runner = BenchmarkRunner(tg_client=tg_client, llm_client=llm_client)
 
     def _run_suite() -> List[Dict[str, Any]]:
-        results = []
-        for item in subset:
-            q = item.get("question", "")
-            gt = item.get("ground_truth") or (item.get("answer")[0] if isinstance(item.get("answer"), list) else None)
-            res = runner.evaluate_question(q, gt)
-            results.append(res)
-        return results
+        return [
+            runner.evaluate_question(item.get("question", ""), extract_ground_truth(item))
+            for item in subset
+        ]
 
     start_t = time.time()
     raw_results = await asyncio.to_thread(_run_suite)
     total_duration = time.time() - start_t
 
     # Aggregate tabular rows and comparative metrics
+    def _round(value: Optional[float], ndigits: int = 2) -> Optional[float]:
+        return None if value is None else round(float(value), ndigits)
+
     rows = []
+    pipelines = ["standard_rag", "graph_rag", "agentic_rag"]
     stats = {
-        "standard_rag": {"total_completeness": 0.0, "total_tokens": 0, "total_latency": 0.0, "count": 0},
-        "graph_rag": {"total_completeness": 0.0, "total_tokens": 0, "total_latency": 0.0, "count": 0},
-        "agentic_rag": {"total_completeness": 0.0, "total_tokens": 0, "total_latency": 0.0, "count": 0},
+        pipe: {"completeness": [], "accuracy": [], "total_tokens": 0, "total_latency": 0.0, "count": 0}
+        for pipe in pipelines
     }
 
     for item in raw_results:
         q = item.get("question", "")
         gt = item.get("ground_truth")
-        for pipe in ["standard_rag", "graph_rag", "agentic_rag"]:
+        for pipe in pipelines:
             p = item.get(pipe, {})
-            comp = float(p.get("completeness_score", 0.0))
+            comp = p.get("completeness_score")
+            acc = p.get("accuracy_score")
             tok = int(p.get("total_tokens", 0))
             lat = float(p.get("latency_seconds", 0.0))
 
-            stats[pipe]["total_completeness"] += comp
+            if comp is not None:
+                stats[pipe]["completeness"].append(float(comp))
+            if acc is not None:
+                stats[pipe]["accuracy"].append(float(acc))
             stats[pipe]["total_tokens"] += tok
             stats[pipe]["total_latency"] += lat
             stats[pipe]["count"] += 1
@@ -392,8 +408,8 @@ async def run_benchmark_endpoint(req: BenchmarkRequest) -> Dict[str, Any]:
                     "agentic_rag": "Agentic GraphRAG (GraphScout)",
                 }.get(pipe, pipe),
                 "answer": p.get("answer", ""),
-                "accuracy": round(p.get("accuracy_score", 0.0), 2),
-                "completeness": round(comp, 2),
+                "accuracy": _round(acc),
+                "completeness": _round(comp),
                 "total_tokens": tok,
                 "latency_seconds": round(lat, 3),
                 "entities_count": p.get("retrieved_entities_count", 0),
@@ -401,11 +417,16 @@ async def run_benchmark_endpoint(req: BenchmarkRequest) -> Dict[str, Any]:
             })
 
     # Summary averages
+    # Summary averages (score averages are null when the dataset has no ground truth)
+    def _mean(values: List[float]) -> Optional[float]:
+        return round(sum(values) / len(values), 3) if values else None
+
     summary = {}
     for pipe, s in stats.items():
         cnt = max(s["count"], 1)
         summary[pipe] = {
-            "avg_completeness": round(s["total_completeness"] / cnt, 3),
+            "avg_completeness": _mean(s["completeness"]),
+            "avg_accuracy": _mean(s["accuracy"]),
             "avg_tokens": int(s["total_tokens"] / cnt),
             "avg_latency": round(s["total_latency"] / cnt, 3),
         }
@@ -415,6 +436,12 @@ async def run_benchmark_endpoint(req: BenchmarkRequest) -> Dict[str, Any]:
         "questions_evaluated": len(subset),
         "total_duration_seconds": round(total_duration, 2),
         "summary": summary,
+        "llm": {
+            "provider": llm_client.provider_name,
+            "model": llm_client.model_name,
+            "live": llm_client.is_live,
+            "fallback_calls": llm_client.fallback_calls,
+        },
         "rows": rows,
         "raw_results": raw_results,
     }
@@ -500,89 +527,66 @@ async def get_corpus_document(doc_id: str) -> Dict[str, Any]:
 
 @app.post("/api/ingest")
 async def ingest_corpus_endpoint(req: IngestRequest) -> Dict[str, Any]:
-    """Ingest a batch of corpus documents into TigerGraph."""
+    """Ingest a batch of corpus documents into the graph backend."""
     from src.db.ingest_corpus import ingest_corpus
 
-    def _ingest():
-        ingest_corpus(max_docs=req.max_docs)
+    tg = get_tg_client()
+    corpus_file = DATA_DIR / "documents" / "corpus.jsonl"
+
+    def _ingest() -> int:
+        # Ingest into the shared client so the running app actually sees the data.
+        return ingest_corpus(str(corpus_file), max_docs=req.max_docs, tg_client=tg)
 
     start_t = time.time()
-    await asyncio.to_thread(_ingest)
+    docs_ingested = await asyncio.to_thread(_ingest)
     duration = time.time() - start_t
+    graph_stats = await asyncio.to_thread(tg.stats)
 
-    tg = get_tg_client()
     return {
-        "success": True,
-        "docs_ingested": req.max_docs,
+        "success": docs_ingested > 0,
+        "docs_ingested": docs_ingested,
         "duration_seconds": round(duration, 2),
-        "total_entities": len(tg._mock_vertices.get("Entity", {})),
-        "total_chunks": len(tg._mock_vertices.get("Chunk", {})),
+        "total_entities": graph_stats["entities"],
+        "total_chunks": graph_stats["chunks"],
     }
 
 
 @app.get("/api/schema")
-async def get_gsql_schema() -> Dict[str, Any]:
-    """Return TigerGraph GSQL schema definition, vertices, edges, and installed queries."""
-    schema_file = SCHEMA_DIR / "graph_schema.gsql"
-    content = ""
-    if schema_file.exists():
-        with open(schema_file, "r", encoding="utf-8") as f:
-            content = f.read()
+async def get_graph_schema() -> Dict[str, Any]:
+    """The graph data model plus the Cypher the Neo4j backend runs (the in-memory backend mirrors it)."""
+    from src.db.neo4j_client import QUERIES, SCHEMA_STATEMENTS
+
+    tg = get_tg_client()
+    code = "// Indexes and constraints (applied automatically on connect)\n" + ";\n".join(SCHEMA_STATEMENTS) + ";\n"
+    for q in QUERIES:
+        code += f"\n// {q['name']}: {q['description']}\n{q['cypher'].strip()}\n"
 
     return {
-        "schema_name": "GraphScoutKG",
-        "file_path": str(schema_file.relative_to(PROJECT_ROOT)) if schema_file.exists() else None,
-        "gsql_code": content,
-        "vertices": [
+        "backend": tg.backend,
+        "language": "cypher",
+        "file_path": "backend/src/db/neo4j_client.py",
+        "code": code,
+        "nodes": [
             {
-                "name": "Document",
-                "primary_id": "doc_id (STRING)",
-                "description": "Source documents (Wikipedia Olympic articles, reports)",
-                "attributes": ["title", "source_url", "doc_type", "published_at", "version", "created_at"],
+                "name": "Entity",
+                "key": "entity_id",
+                "description": "Olympic events, venues, Games and gold medallists extracted from the corpus",
+                "attributes": ["name", "name_lower", "entity_type", "description"],
             },
             {
                 "name": "Chunk",
-                "primary_id": "chunk_id (STRING)",
-                "description": "Dense semantic text passages with vector embeddings",
-                "attributes": ["chunk_index", "text_content", "token_count", "embedding", "section_header"],
-            },
-            {
-                "name": "Entity",
-                "primary_id": "entity_id (STRING)",
-                "description": "Extracted named entities (Venues, Athletes, Countries, Sports)",
-                "attributes": ["canonical_name", "entity_type", "description", "aliases", "importance_score"],
-            },
-            {
-                "name": "Event",
-                "primary_id": "event_id (STRING)",
-                "description": "Olympic competitions, dates, and historical contests",
-                "attributes": ["event_name", "event_type", "event_date", "description", "details"],
+                "key": "chunk_id",
+                "description": "Document text passages with a 1536-dim embedding in a native vector index",
+                "attributes": ["doc_id", "text_content", "section_header", "token_count", "embedding"],
             },
         ],
-        "edges": [
-            {"name": "HAS_CHUNK", "from": "Document", "to": "Chunk", "type": "Directed", "description": "Connects parent document to semantic chunks"},
-            {"name": "MENTIONS", "from": "Chunk", "to": "Entity", "type": "Directed", "description": "Links text chunk mentions to extracted knowledge entities"},
-            {"name": "RELATED_TO", "from": "Entity", "to": "Entity", "type": "Undirected", "description": "Cross-entity relations (competed_in, located_at, medal_won)"},
-            {"name": "PARTICIPATES_IN", "from": "Entity", "to": "Event", "type": "Directed", "description": "Athletes/Teams competing in Olympic events"},
-            {"name": "SUPERSEDES", "from": "Event", "to": "Event", "type": "Directed", "description": "Historical, temporal or conflict resolution link"},
+        "relationships": [
+            {"name": "RELATED_TO", "from": "Entity", "to": "Entity", "type": "Directed",
+             "description": "relation_type is HELD_AT (venue), PART_OF_GAMES (Games) or WON_GOLD (athlete); traversed in both directions"},
+            {"name": "MENTIONS", "from": "Chunk", "to": "Entity", "type": "Directed",
+             "description": "A document's text passage mentions the entities extracted from it (provenance)"},
         ],
-        "installed_queries": [
-            {
-                "name": "get_entity_subgraph",
-                "parameters": "STRING seed_entity_id, INT max_hops",
-                "description": "Executes GSQL BFS neighborhood traversal expanding multi-hop entity relations.",
-            },
-            {
-                "name": "get_entity_provenance",
-                "parameters": "STRING entity_id",
-                "description": "Traverses MENTIONS <- HAS_CHUNK edges back to source Document chunks.",
-            },
-            {
-                "name": "detect_superseded_events",
-                "parameters": "STRING event_id",
-                "description": "Identifies temporal contradictions, amended results, or superseded records.",
-            },
-        ],
+        "queries": [{k: q[k] for k in ("name", "parameters", "description")} for q in QUERIES],
     }
 
 
@@ -598,5 +602,5 @@ async def root():
         "version": "2.0.0",
         "status": "online",
         "docs": "/docs",
-        "engine": "TigerGraph Hybrid Graph + Vector DB",
+        "engine": f"{get_tg_client().mode_label} graph + vector search",
     }

@@ -1,7 +1,7 @@
 """Autonomous Orchestrator Agent for GraphScout.
 
 Implements the central multi-hop reasoning loop, dynamic tool selection,
-gap-driven investigation, hypothesis refinement, and evidence synthesis on TigerGraph.
+gap-driven investigation, hypothesis refinement, and evidence synthesis over the knowledge graph.
 """
 
 from __future__ import annotations
@@ -24,7 +24,9 @@ from src.agents.state import (
 from src.agents.tools.evaluator_tool import EvaluatorTool
 from src.agents.tools.graph_tool import GraphTool
 from src.agents.tools.vector_tool import VectorTool
-from src.db.tigergraph_client import TigerGraphClient
+from src.db.events import EventFilter, format_event_table
+from src.db.graph_client import GraphClient
+from src.utils.embeddings import local_embed_array
 from src.utils.llm_client import LLMClient
 
 logger = logging.getLogger("GraphScout.Orchestrator")
@@ -38,6 +40,7 @@ class OrchestratorDecision(BaseModel):
     search_queries: List[str] = Field(default_factory=list, description="Queries if action is vector_search")
     seed_entities: List[str] = Field(default_factory=list, description="Target entity IDs if action is graph_traversal")
     max_hops: int = Field(default=2, description="Hop depth for graph traversal")
+    event_filter: EventFilter = Field(default_factory=EventFilter, description="Filters if action is find_events")
     resolved_gap_ids: List[str] = Field(default_factory=list)
 
 
@@ -51,9 +54,19 @@ class SynthesisResult(BaseModel):
 class OrchestratorAgent:
     """Core autonomous decision engine coordinating Graph, Vector, and Evaluation tools."""
 
+    # Prompt-size caps for final synthesis (keeps requests under small-tier TPM limits).
+    MAX_PROMPT_NODES = 30
+    MAX_PROMPT_EDGES = 40
+    MAX_PROMPT_CHUNKS = 6
+    MAX_CHUNK_CHARS = 700
+    MAX_FINDINGS_CHARS = 3500  # structured event tables in a prompt
+    PROVENANCE_CANDIDATES = 40  # chunks fetched per traversal before ranking by the question
+    PROVENANCE_KEEP = 5
+    EVENT_CHUNKS = 3  # top find_events rows whose full text is added as passages
+
     def __init__(
         self,
-        tg_client: TigerGraphClient,
+        tg_client: GraphClient,
         llm_client: LLMClient,
         max_iterations: int = 6,
         completeness_threshold: float = 0.85,
@@ -104,6 +117,8 @@ class OrchestratorAgent:
             if decision.updated_hypothesis:
                 state.current_hypothesis = decision.updated_hypothesis
 
+            self._resolve_gaps(state, decision.resolved_gap_ids)
+            self._avoid_repeat(decision, state)
             step_trace = self._execute_decision(decision, state)
             step_trace.duration_ms = (time.time() - step_start) * 1000.0
             state.record_step(step_trace)
@@ -126,16 +141,83 @@ class OrchestratorAgent:
         )
         return state
 
+    @staticmethod
+    def _avoid_repeat(decision: OrchestratorDecision, state: InvestigationState) -> None:
+        """Re-running the identical retrieval returns nothing new, so evaluate (or finish) instead."""
+        if not state.step_history or decision.action not in (
+            AgentActionType.GRAPH_TRAVERSAL, AgentActionType.VECTOR_SEARCH, AgentActionType.ENTITY_LINKING,
+            AgentActionType.FIND_EVENTS,
+        ):
+            return
+        last = state.step_history[-1]
+        current = decision.model_dump()
+        same_inputs = all(
+            last.tool_inputs.get(k) == current.get(k) for k in ("search_queries", "seed_entities", "max_hops", "event_filter")
+        )
+        if last.action_taken == decision.action and same_inputs:
+            already_evaluated = any(s.action_taken == AgentActionType.EVALUATE_EVIDENCE for s in state.step_history)
+            decision.action = AgentActionType.FINISH if already_evaluated else AgentActionType.EVALUATE_EVIDENCE
+            decision.reasoning = f"[Repeated step skipped] {decision.reasoning}"
+
+    @staticmethod
+    def _rank_by_query(query: str, chunks: List[DocumentChunk]) -> List[DocumentChunk]:
+        """Order chunks by lexical similarity to the question (scores from different tools are not comparable)."""
+        q_vec = local_embed_array(query)
+        return sorted(
+            chunks,
+            key=lambda c: float(local_embed_array(f"{c.section_header or ''}\n{c.text_content}") @ q_vec),
+            reverse=True,
+        )
+
+    def _findings_text(self, state: InvestigationState) -> str:
+        """Latest structured event tables, newest first, within a character budget."""
+        if not state.event_findings:
+            return "None"
+        out: List[str] = []
+        used = 0
+        for table in reversed(state.event_findings):
+            if out and used + len(table) > self.MAX_FINDINGS_CHARS:
+                break
+            out.append(table[: self.MAX_FINDINGS_CHARS])
+            used += len(table)
+        return "\n\n".join(out)
+
+    @staticmethod
+    def _resolve_gaps(state: InvestigationState, gap_ids: List[str]) -> None:
+        """Mark gaps the orchestrator reports as closed so they leave the open-gap list."""
+        if not gap_ids:
+            return
+        ids = set(gap_ids)
+        for gap in state.identified_gaps:
+            if gap.gap_id in ids:
+                gap.resolved = True
+
     def _decide_next_step(self, state: InvestigationState) -> OrchestratorDecision:
         """LLM-guided meta-decision engine selecting the optimal tool action."""
         system_prompt = (
-            "You are the Master Orchestrator for GraphScout, an Agentic GraphRAG system on TigerGraph. "
+            "You are the Master Orchestrator for GraphScout, an Agentic GraphRAG system over a knowledge graph. "
             "Your objective is to answer complex multi-hop queries through dynamic tool routing:\n"
             "- 'entity_linking': extract new entity anchors from latest observations\n"
-            "- 'graph_traversal': expand N-hop relationships around specific seed entities via TigerGraph GSQL\n"
-            "- 'vector_search': query TigerGraph Vector DB for dense textual chunk context\n"
+            "- 'graph_traversal': expand N-hop relationships around specific seed entities in the knowledge graph\n"
+            "- 'vector_search': search the vector index for relevant text chunks\n"
+            "- 'find_events': structured filter over ALL Olympic events (sport, event name, year, season, "
+            "year_before, venue, date, min/max competitors, sort). It returns exact counts and sorted rows "
+            "with each event's games, venue, date, competitors, nations and gold medallist.\n"
             "- 'evaluate_evidence': assess completeness, detect contradictions/superseded facts, and formulate gaps\n"
-            "- 'finish': conclude investigation when sufficient evidence is accumulated."
+            "- 'finish': conclude investigation when sufficient evidence is accumulated.\n\n"
+            "Field rules: for 'graph_traversal' put entity NAMES as written in the question or evidence "
+            "(e.g. venues, Games such as '2012 Summer Olympics', athletes, event titles) in seed_entities. "
+            "For 'vector_search' put 1-3 short keyword queries in search_queries. "
+            "Use resolved_gap_ids to close gaps the evidence now answers. Do not repeat an action that "
+            "returned nothing; prefer 'finish' once the evidence contains the answer.\n\n"
+            "Prefer 'find_events' (fill event_filter) whenever the question is about Olympic events and asks:\n"
+            "- how many events match a condition -> sport, year, min_competitors (strictly more than); read the total count\n"
+            "- which event had the most/fewest competitors or nations -> sport, year, sort_by, descending\n"
+            "- the Games held immediately before YEAR -> sport, event (e.g. \"men's pole vault\"), season, "
+            "year_before=YEAR, sort_by='year', descending=true, limit=1\n"
+            "- the event held at VENUE on DATE -> venue and date copied verbatim from the question (plus year if stated)\n"
+            "- facts about a named event -> event with the event's title or name\n"
+            "Search results and graph neighbourhoods only cover a sample of events, so never count or rank from them."
         )
 
         discovered_nodes = [f"{n.canonical_name} ({n.entity_id})" for n in state.subgraph.nodes[:10]]
@@ -158,11 +240,17 @@ SUBGRAPH NODES ({len(state.subgraph.nodes)}):
 
 CHUNKS ACCUMULATED: {len(state.document_chunks)}
 
+STRUCTURED EVENT RESULTS:
+{self._findings_text(state)}
+
 UNRESOLVED GAPS:
 {chr(10).join(known_gaps) if known_gaps else "None identified yet."}
 
+RECENT EVIDENCE TITLES:
+{chr(10).join(f"- [{cid}] {c.section_header}" for cid, c in list(state.document_chunks.items())[-8:]) if state.document_chunks else "None"}
+
 STEP HISTORY:
-{chr(10).join(f"Step {s.step_index}: {s.action_taken.value} -> {s.reasoning}" for s in state.step_history[-3:]) if state.step_history else "Initial Step"}
+{chr(10).join(f"Step {s.step_index}: {s.action_taken.value} -> {s.tool_outputs_summary}" for s in state.step_history[-4:]) if state.step_history else "Initial Step"}
 
 Decide the best next action and return an OrchestratorDecision.
 """
@@ -205,11 +293,35 @@ Decide the best next action and return an OrchestratorDecision.
                 state.add_entity(node)
                 discovered_entities.append(node.canonical_name)
 
-            prov_chunks = self.tg_client.get_entity_provenance(seeds, max_chunks=5)
-            for c in prov_chunks:
+            # A hub (a venue, a Games) backs dozens of documents; keep the ones closest to the question.
+            prov_chunks = self.tg_client.get_entity_provenance(seeds, max_chunks=self.PROVENANCE_CANDIDATES)
+            for c in self._rank_by_query(state.user_query, prov_chunks)[: self.PROVENANCE_KEEP]:
                 state.add_chunk(c)
 
             summary = f"Traversed {len(subgraph.nodes)} nodes & {len(subgraph.edges)} edges around {seeds}."
+
+        elif action == AgentActionType.FIND_EVENTS:
+            f = decision.event_filter
+            if f.is_empty():
+                summary = "find_events skipped: no filters were given."
+            else:
+                total, rows = self.tg_client.find_events(f)
+                state.event_findings.append(format_event_table(f, total, rows))
+                # Show the matched events in the graph and add the top ones' full text as passages.
+                state.retrieved_subgraphs = state.retrieved_subgraphs.merge(SubgraphData(nodes=[
+                    EntityNode(entity_id=r["entity_id"], canonical_name=r.get("title") or r["entity_id"],
+                               entity_type="OlympicEvent", description=f"{r.get('games')} | {r.get('venue')}")
+                    for r in rows
+                ]))
+                top_ids = [r["entity_id"] for r in rows[: self.EVENT_CHUNKS]]
+                wanted = {f"chunk_{i}" for i in top_ids}
+                if top_ids:
+                    for c in self.tg_client.get_entity_provenance(top_ids, max_chunks=len(top_ids) * 4):
+                        if c.chunk_id in wanted:
+                            state.add_chunk(c)
+                            chunks_retrieved_count += 1
+                discovered_entities = [r.get("title") or r["entity_id"] for r in rows]
+                summary = f"Matched {total} event(s) for {f.describe()}."
 
         elif action == AgentActionType.EVALUATE_EVIDENCE:
             verdict, usage = self.evaluator_tool.evaluate(
@@ -217,11 +329,19 @@ Decide the best next action and return an OrchestratorDecision.
                 state.current_hypothesis,
                 state.retrieved_subgraphs,
                 state.document_chunks,
-                state.identified_gaps,
+                [g for g in state.identified_gaps if not g.resolved],
+                event_findings=self._findings_text(state),
             )
             state.token_metrics.add(usage.get("prompt_tokens", 0), usage.get("completion_tokens", 0))
             state.evaluation = verdict
-            state.identified_gaps.extend(verdict.knowledge_gaps)
+            # Only record gaps we haven't seen yet (the evaluator often re-reports open ones).
+            known = {g.gap_id for g in state.identified_gaps} | {
+                g.description.strip().lower() for g in state.identified_gaps
+            }
+            for gap in verdict.knowledge_gaps:
+                if gap.gap_id not in known and gap.description.strip().lower() not in known:
+                    state.identified_gaps.append(gap)
+                    known.update({gap.gap_id, gap.description.strip().lower()})
             summary = f"Evaluated completeness: score={verdict.completeness_score:.2f}, sufficient={verdict.has_sufficient_evidence}"
 
             if verdict.has_sufficient_evidence:
@@ -243,14 +363,31 @@ Decide the best next action and return an OrchestratorDecision.
     def _synthesize_final_answer(self, state: InvestigationState) -> None:
         """Synthesize final structured answer referencing multi-hop graph paths and chunks."""
         system_prompt = (
-            "You are GraphScout, an elite investigative reasoning engine on TigerGraph. "
+            "You are GraphScout, an elite investigative reasoning engine over a knowledge graph. "
             "Synthesize a rigorous, evidence-backed answer to the user query using the multi-hop subgraphs and text chunks. "
-            "Include explicit citations to entities and chunk identifiers."
+            "Include explicit citations to entities and chunk identifiers. "
+            "STRUCTURED EVENT RESULTS come from filtering every event in the corpus: their counts and orderings are "
+            "exact, so prefer them over passages for counting, ranking and date/venue questions. "
+            "When the answer is an event, give its full title (e.g. 'Athletics at the 2008 Summer Olympics \u2013 Men's marathon'). "
+            "If several events match the question, say so and list them. Write numbers as digits (5, not five)."
         )
 
-        subgraph_nodes = [f"- {n.canonical_name} ({n.entity_type})" for n in state.subgraph.nodes]
-        subgraph_edges = [f"- {e.source_id} -[{e.relation_type}]-> {e.target_id} (conf={e.confidence})" for e in state.subgraph.edges]
-        chunks_text = [f"[{c_id}] {c.text_content}" for c_id, c in state.document_chunks.items()]
+        # Keep the prompt compact (provider token limits): closest nodes, a bounded edge
+        # list, and the highest-scoring chunks, each truncated.
+        names = {n.entity_id: n.canonical_name for n in state.subgraph.nodes}
+        nodes = sorted(state.subgraph.nodes, key=lambda n: n.source_hops)[: self.MAX_PROMPT_NODES]
+        subgraph_nodes = [f"- {n.canonical_name} ({n.entity_type})" for n in nodes]
+        subgraph_edges = [
+            f"- {names.get(e.source_id, e.source_id)} -[{e.relation_type}]-> {names.get(e.target_id, e.target_id)}"
+            for e in state.subgraph.edges[: self.MAX_PROMPT_EDGES]
+        ]
+        # Chunks come from different tools with incomparable scores, so rank them all
+        # by lexical similarity to the question.
+        top_chunks = self._rank_by_query(state.user_query, list(state.document_chunks.values()))
+        chunks_text = [
+            f"[{c.chunk_id}] {c.text_content[: self.MAX_CHUNK_CHARS]}"
+            for c in top_chunks[: self.MAX_PROMPT_CHUNKS]
+        ]
 
         user_prompt = f"""
 USER QUERY:
@@ -264,6 +401,9 @@ GRAPH RELATIONS:
 
 GRAPH NODES:
 {chr(10).join(subgraph_nodes) if subgraph_nodes else "None"}
+
+STRUCTURED EVENT RESULTS:
+{self._findings_text(state)}
 
 DOCUMENT EVIDENCE:
 {chr(10).join(chunks_text) if chunks_text else "None"}

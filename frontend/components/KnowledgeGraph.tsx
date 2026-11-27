@@ -1,213 +1,247 @@
 "use client";
 
-import React, { useEffect, useRef, useState } from "react";
-import { SubgraphData, GraphNode } from "../lib/types";
-import { ZoomIn, ZoomOut, Maximize2, Info, Activity } from "lucide-react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { GraphNode, SubgraphData } from "../lib/types";
+import { Maximize2, MousePointerClick, Network, X, ZoomIn, ZoomOut } from "lucide-react";
+import { EmptyState } from "./ui";
 
 interface KnowledgeGraphProps {
   subgraph: SubgraphData;
 }
 
+const TYPE_COLORS: Record<string, string> = {
+  OlympicEvent: "#f59e0b",
+  Event: "#f59e0b",
+  OlympicGames: "#3b82f6",
+  Venue: "#a855f7",
+  Athlete: "#10b981",
+  Person: "#10b981",
+  Organization: "#22d3ee",
+  Document: "#6366f1",
+};
+const FALLBACK_COLOR = "#64748b";
+
+const TYPE_LABELS: Record<string, string> = {
+  OlympicEvent: "Event",
+  OlympicGames: "Games",
+};
+
+const colorFor = (type: string) => TYPE_COLORS[type] ?? FALLBACK_COLOR;
+const truncate = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
+
 export default function KnowledgeGraph({ subgraph }: KnowledgeGraphProps) {
   const containerRef = useRef<HTMLDivElement>(null);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const networkRef = useRef<any>(null);
-  const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
+  const [selected, setSelected] = useState<GraphNode | null>(null);
+  const [ready, setReady] = useState(false);
+
+  const nodeById = useMemo(() => new Map(subgraph.nodes.map((n) => [n.id, n])), [subgraph]);
+  const presentTypes = useMemo(() => {
+    const counts = new Map<string, number>();
+    subgraph.nodes.forEach((n) => counts.set(n.entity_type, (counts.get(n.entity_type) ?? 0) + 1));
+    return Array.from(counts.entries()).sort((a, b) => b[1] - a[1]);
+  }, [subgraph]);
+
+  const connections = useMemo(() => {
+    if (!selected) return [];
+    return subgraph.edges
+      .filter((e) => e.from === selected.id || e.to === selected.id)
+      .map((e) => {
+        const otherId = e.from === selected.id ? e.to : e.from;
+        return { relation: e.relation_type, outgoing: e.from === selected.id, other: nodeById.get(otherId), otherId };
+      });
+  }, [selected, subgraph, nodeById]);
 
   useEffect(() => {
-    if (!containerRef.current || !subgraph.nodes || subgraph.nodes.length === 0) return;
+    if (!containerRef.current || subgraph.nodes.length === 0) return;
+    let cancelled = false;
+    setReady(false);
+    setSelected(null);
 
-    let isMounted = true;
-
-    // Dynamically import vis-network to avoid SSR window errors
-    Promise.all([
-      import("vis-network/standalone/umd/vis-network.min.js"),
-    ]).then(([visModule]) => {
-      if (!isMounted || !containerRef.current) return;
+    import("vis-network/standalone/umd/vis-network.min.js").then((visModule) => {
+      if (cancelled || !containerRef.current) return;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const vis = (visModule as any).default || visModule;
-
-      const colorMap: Record<string, { bg: string; border: string; highlight: string }> = {
-        Organization: { bg: "#00d2ff", border: "#38bdf8", highlight: "#bae6fd" },
-        Event: { bg: "#f59e0b", border: "#fbbf24", highlight: "#fef3c7" },
-        Person: { bg: "#10b981", border: "#34d399", highlight: "#d1fae5" },
-        Athlete: { bg: "#10b981", border: "#34d399", highlight: "#d1fae5" },
-        Sport: { bg: "#3b82f6", border: "#60a5fa", highlight: "#dbeafe" },
-        Venue: { bg: "#a855f7", border: "#c084fc", highlight: "#f3e8ff" },
-        Document: { bg: "#6366f1", border: "#818cf8", highlight: "#e0e7ff" },
-        Chunk: { bg: "#64748b", border: "#94a3b8", highlight: "#f1f5f9" },
-      };
+      const degree = new Map<string, number>();
+      subgraph.edges.forEach((e) => {
+        degree.set(e.from, (degree.get(e.from) ?? 0) + 1);
+        degree.set(e.to, (degree.get(e.to) ?? 0) + 1);
+      });
 
       const nodes = subgraph.nodes.map((n) => {
-        const col = colorMap[n.entity_type] || { bg: "#38bdf8", border: "#0284c7", highlight: "#bae6fd" };
+        const color = colorFor(n.entity_type);
+        const isSeed = (n.hops ?? 1) === 0;
         return {
           id: n.id,
-          label: n.label,
-          title: `${n.label} (${n.entity_type})`,
-          shape: "box",
-          margin: 10,
-          font: { color: "#ffffff", size: 13, face: "sans-serif" },
+          label: truncate(n.label, 28),
+          title: `${n.label}\n${TYPE_LABELS[n.entity_type] ?? n.entity_type}`,
+          shape: "dot",
+          size: isSeed ? 20 : 9 + Math.min(degree.get(n.id) ?? 0, 10),
+          borderWidth: isSeed ? 3 : 1.5,
           color: {
-            background: col.bg,
-            border: col.border,
-            highlight: { background: col.highlight, border: "#ffffff" },
+            background: color,
+            border: isSeed ? "#ffffff" : color,
+            highlight: { background: color, border: "#ffffff" },
+            hover: { background: color, border: "#e2e8f0" },
           },
-          shadow: { enabled: true, color: "rgba(0,0,0,0.6)", size: 8, x: 2, y: 2 },
-          data: n,
+          font: { color: "#cbd5e1", size: isSeed ? 13 : 11, face: "Inter, system-ui, sans-serif", strokeWidth: 3, strokeColor: "#080d1a" },
         };
       });
 
-      const edges = subgraph.edges.map((e, idx) => ({
-        id: `e-${idx}`,
+      const edges = subgraph.edges.map((e, i) => ({
+        id: `e-${i}`,
         from: e.from,
         to: e.to,
-        label: e.label || "",
-        arrows: "to",
-        font: { color: "#94a3b8", size: 10, align: "middle" },
-        color: { color: "rgba(148, 163, 184, 0.4)", highlight: "#00d2ff" },
-        smooth: { type: "continuous" },
+        title: e.relation_type,
+        arrows: { to: { enabled: true, scaleFactor: 0.5 } },
+        color: { color: "rgba(148,163,184,0.25)", highlight: "#22d3ee", hover: "rgba(148,163,184,0.6)" },
+        width: 1,
+        selectionWidth: 1.5,
+        smooth: { enabled: true, type: "continuous", roundness: 0.3 },
       }));
 
-      const data = {
-        nodes: new vis.DataSet(nodes),
-        edges: new vis.DataSet(edges),
-      };
-
-      const options = {
-        physics: {
-          enabled: true,
-          barnesHut: {
-            gravitationalConstant: -2800,
-            centralGravity: 0.25,
-            springLength: 130,
-            springConstant: 0.04,
+      networkRef.current?.destroy();
+      const network = new vis.Network(
+        containerRef.current,
+        { nodes: new vis.DataSet(nodes), edges: new vis.DataSet(edges) },
+        {
+          physics: {
+            solver: "forceAtlas2Based",
+            forceAtlas2Based: { gravitationalConstant: -45, springLength: 90, avoidOverlap: 0.4 },
+            stabilization: { iterations: 250, fit: true },
           },
-          stabilization: { iterations: 120 },
-        },
-        interaction: {
-          hover: true,
-          zoomView: true,
-          dragView: true,
-          navigationButtons: false,
-        },
-      };
-
-      if (networkRef.current) {
-        networkRef.current.destroy();
-      }
-
-      const network = new vis.Network(containerRef.current, data, options);
+          interaction: { hover: true, tooltipDelay: 150, hideEdgesOnDrag: true },
+          layout: { improvedLayout: subgraph.nodes.length < 150 },
+        }
+      );
       networkRef.current = network;
 
-      network.on("click", (params: any) => {
-        if (params.nodes && params.nodes.length > 0) {
-          const clickedId = params.nodes[0];
-          const nodeObj = subgraph.nodes.find((n) => n.id === clickedId) || null;
-          setSelectedNode(nodeObj);
-        } else {
-          setSelectedNode(null);
-        }
+      network.once("stabilizationIterationsDone", () => {
+        network.setOptions({ physics: false }); // stop the jitter once laid out
+        network.fit({ animation: { duration: 400, easingFunction: "easeInOutQuad" } });
+        if (!cancelled) setReady(true);
       });
-
-      setTimeout(() => {
-        network.fit({ animation: { duration: 600, easingFunction: "easeInOutQuad" } });
-      }, 300);
+      network.on("click", (params: { nodes: string[] }) => {
+        setSelected(params.nodes.length ? (nodeById.get(params.nodes[0]) ?? null) : null);
+      });
     });
 
     return () => {
-      isMounted = false;
-      if (networkRef.current) {
-        networkRef.current.destroy();
-      }
+      cancelled = true;
+      networkRef.current?.destroy();
+      networkRef.current = null;
     };
-  }, [subgraph]);
+  }, [subgraph, nodeById]);
 
-  const handleFit = () => networkRef.current?.fit({ animation: true });
-  const handleZoomIn = () => {
-    if (!networkRef.current) return;
-    const scale = networkRef.current.getScale();
-    networkRef.current.moveTo({ scale: scale * 1.3, animation: true });
-  };
-  const handleZoomOut = () => {
-    if (!networkRef.current) return;
-    const scale = networkRef.current.getScale();
-    networkRef.current.moveTo({ scale: scale * 0.7, animation: true });
+  const zoom = (factor: number) => {
+    const net = networkRef.current;
+    if (net) net.moveTo({ scale: net.getScale() * factor, animation: { duration: 200 } });
   };
 
-  if (!subgraph.nodes || subgraph.nodes.length === 0) {
+  const focusNode = (id: string) => {
+    const net = networkRef.current;
+    if (!net) return;
+    net.selectNodes([id]);
+    net.focus(id, { scale: 1.2, animation: { duration: 400 } });
+    setSelected(nodeById.get(id) ?? null);
+  };
+
+  if (subgraph.nodes.length === 0) {
     return (
-      <div className="flex flex-col items-center justify-center h-96 text-slate-500 text-sm">
-        <Activity className="w-8 h-8 mb-2 opacity-50" />
-        <p>No knowledge graph entities discovered for this query.</p>
-      </div>
+      <EmptyState icon={Network} title="No graph entities for this run">
+        The agent answered without traversing the graph, or the entities it looked for weren&apos;t found. Check the Agent steps tab.
+      </EmptyState>
     );
   }
 
-  return (
-    <div className="relative">
-      {/* Legend & Controls Toolbar */}
-      <div className="flex flex-wrap items-center justify-between gap-4 mb-3 px-1">
-        <div className="flex flex-wrap items-center gap-3 text-xs text-slate-400">
-          <div className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-[#00d2ff]" /> Organization</div>
-          <div className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-[#f59e0b]" /> Event / Date</div>
-          <div className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-[#10b981]" /> Athlete / Person</div>
-          <div className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-[#a855f7]" /> Venue</div>
-          <div className="flex items-center gap-1.5"><span className="w-2.5 h-2.5 rounded-full bg-[#3b82f6]" /> Sport</div>
-        </div>
+  const ctrl = "rounded-md border border-white/10 bg-slate-900/90 p-1.5 text-slate-300 backdrop-blur hover:bg-slate-800 hover:text-white";
 
-        <div className="flex items-center gap-1.5">
-          <button onClick={handleZoomIn} title="Zoom In" className="p-1.5 rounded bg-slate-800 text-slate-300 hover:text-white hover:bg-slate-700">
-            <ZoomIn className="w-4 h-4" />
-          </button>
-          <button onClick={handleZoomOut} title="Zoom Out" className="p-1.5 rounded bg-slate-800 text-slate-300 hover:text-white hover:bg-slate-700">
-            <ZoomOut className="w-4 h-4" />
-          </button>
-          <button onClick={handleFit} title="Fit View" className="flex items-center gap-1 px-2.5 py-1.5 rounded bg-slate-800 text-slate-300 hover:text-white hover:bg-slate-700 text-xs font-semibold">
-            <Maximize2 className="w-3.5 h-3.5" />
-            <span>Fit</span>
-          </button>
-        </div>
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <ul className="flex flex-wrap items-center gap-x-4 gap-y-1.5 text-xs text-slate-400" aria-label="Legend">
+          {presentTypes.map(([type, count]) => (
+            <li key={type} className="flex items-center gap-1.5">
+              <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: colorFor(type) }} aria-hidden />
+              {TYPE_LABELS[type] ?? type}
+              <span className="text-slate-600">{count}</span>
+            </li>
+          ))}
+          <li className="flex items-center gap-1.5">
+            <span className="h-2.5 w-2.5 rounded-full border-2 border-white bg-slate-600" aria-hidden />
+            Starting entity
+          </li>
+        </ul>
+        <span className="flex items-center gap-1.5 text-[11px] text-slate-500">
+          <MousePointerClick className="h-3.5 w-3.5" aria-hidden />
+          Click a node to inspect · scroll to zoom
+        </span>
       </div>
 
-      {/* Network Canvas */}
-      <div
-        ref={containerRef}
-        className="w-full h-[520px] bg-[#080d1a] border border-white/10 rounded-xl overflow-hidden relative shadow-inner"
-      />
+      <div className="relative overflow-hidden rounded-xl border border-white/10 bg-[#080d1a]">
+        <div ref={containerRef} className="h-[420px] w-full sm:h-[540px]" role="img" aria-label={`Knowledge graph with ${subgraph.total_nodes} nodes and ${subgraph.total_edges} edges`} />
 
-      {/* Node Details Inspection Panel */}
-      {selectedNode && (
-        <div className="absolute top-16 right-4 w-72 bg-slate-900/90 border border-cyan-400/40 rounded-xl p-4 shadow-2xl backdrop-blur-md text-xs space-y-2 animate-in fade-in zoom-in-95">
-          <div className="flex items-center justify-between pb-2 border-b border-white/10">
-            <span className="font-bold text-cyan-400 flex items-center gap-1.5">
-              <Info className="w-3.5 h-3.5" /> Entity Inspection
-            </span>
-            <button onClick={() => setSelectedNode(null)} className="text-slate-400 hover:text-white text-sm">&times;</button>
-          </div>
-          <div>
-            <div className="text-slate-400">Canonical Name</div>
-            <div className="font-semibold text-slate-100 text-sm">{selectedNode.label}</div>
-          </div>
-          <div className="flex justify-between">
-            <span className="text-slate-400">Type</span>
-            <span className="font-bold text-amber-400">{selectedNode.entity_type}</span>
-          </div>
-          {selectedNode.hops !== undefined && (
-            <div className="flex justify-between">
-              <span className="text-slate-400">Traversal Hops</span>
-              <span className="font-mono text-slate-200">{selectedNode.hops}</span>
-            </div>
-          )}
-          {selectedNode.aliases && selectedNode.aliases.length > 0 && (
-            <div>
-              <div className="text-slate-400 mb-1">Aliases</div>
-              <div className="flex flex-wrap gap-1">
-                {selectedNode.aliases.map((a, i) => (
-                  <span key={i} className="px-1.5 py-0.5 rounded bg-slate-800 text-slate-300 text-[10px]">{a}</span>
-                ))}
-              </div>
-            </div>
-          )}
+        {!ready && (
+          <div className="absolute inset-0 flex items-center justify-center text-xs text-slate-500">Laying out graph…</div>
+        )}
+
+        <div className="absolute left-3 top-3 flex flex-col gap-1">
+          <button onClick={() => zoom(1.3)} className={ctrl} aria-label="Zoom in">
+            <ZoomIn className="h-4 w-4" />
+          </button>
+          <button onClick={() => zoom(0.75)} className={ctrl} aria-label="Zoom out">
+            <ZoomOut className="h-4 w-4" />
+          </button>
+          <button onClick={() => networkRef.current?.fit({ animation: { duration: 300 } })} className={ctrl} aria-label="Fit graph to view">
+            <Maximize2 className="h-4 w-4" />
+          </button>
         </div>
-      )}
+
+        {selected && (
+          <aside className="absolute inset-x-3 bottom-3 max-h-[70%] overflow-y-auto rounded-xl border border-white/15 bg-slate-950/95 p-4 text-xs shadow-2xl backdrop-blur animate-scale-in sm:inset-x-auto sm:right-3 sm:top-3 sm:bottom-auto sm:w-80">
+            <div className="mb-3 flex items-start justify-between gap-2">
+              <div className="min-w-0">
+                <div className="flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider" style={{ color: colorFor(selected.entity_type) }}>
+                  <span className="h-2 w-2 rounded-full" style={{ backgroundColor: colorFor(selected.entity_type) }} aria-hidden />
+                  {TYPE_LABELS[selected.entity_type] ?? selected.entity_type}
+                  {selected.hops !== undefined && <span className="font-normal normal-case text-slate-500">· {selected.hops} hop{selected.hops === 1 ? "" : "s"} from start</span>}
+                </div>
+                <div className="mt-1 text-sm font-semibold leading-snug text-white">{selected.label}</div>
+              </div>
+              <button onClick={() => setSelected(null)} className="rounded p-1 text-slate-400 hover:bg-white/5 hover:text-white" aria-label="Close details">
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            {selected.description && <p className="mb-3 leading-relaxed text-slate-300">{selected.description}</p>}
+
+            {connections.length > 0 && (
+              <div>
+                <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+                  Connections ({connections.length})
+                </div>
+                <ul className="space-y-1">
+                  {connections.slice(0, 12).map((c, i) => (
+                    <li key={i}>
+                      <button
+                        onClick={() => focusNode(c.otherId)}
+                        className="flex w-full items-center gap-2 rounded px-1.5 py-1 text-left hover:bg-white/5"
+                      >
+                        <span className="shrink-0 font-mono text-[10px] text-slate-500">
+                          {c.outgoing ? "→" : "←"} {c.relation}
+                        </span>
+                        <span className="truncate text-slate-200">{c.other?.label ?? c.otherId}</span>
+                      </button>
+                    </li>
+                  ))}
+                  {connections.length > 12 && <li className="px-1.5 text-slate-500">+{connections.length - 12} more</li>}
+                </ul>
+              </div>
+            )}
+          </aside>
+        )}
+      </div>
     </div>
   );
 }
